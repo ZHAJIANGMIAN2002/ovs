@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+env/
+
+# Datasets (非常重要！)
+# data/
+# datasets/
+# *.zip
+# *.pth
+
+# IDE files
+.vscode/
+.idea/*.pth.tar

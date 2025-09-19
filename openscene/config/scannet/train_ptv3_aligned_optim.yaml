@@ -1,0 +1,72 @@
+# 严格对照实验配置：PTV3架构 + MinkowskiNet优化策略
+# 目标：隔离变量，测试优化策略对性能的影响
+# 保持不变：模型架构、voxel_size、batch_size
+# 对齐修改：优化器、学习率、调度器策略
+
+DATA:
+  data_root: data/scannet_3d
+  data_root_2d_fused_feature: data/scannet_openseg_features
+  feature_2d_extractor: openseg
+  classes: 20
+  aug: True
+  voxel_size: 0.035  # 保持PTV3原有设置，不修改
+  input_color: False # Set to True to use RGB features
+  use_shm: False
+
+DISTILL:
+  # 保持PTV3架构不变
+  arch_3d: PTV3Adapter
+  ptv3_config: config/scannet/ptv3.py
+  
+  ignore_label: 255
+  train_gpu: [0, 1, 2]  # 保持原有GPU配置
+  workers: 12  # 保持原有worker设置
+  batch_size: 3  # 保持原有batch_size，不修改
+  batch_size_val: 3  # 保持原有验证batch_size
+  sync_bn: True
+  multiprocessing_distributed: True
+  dist_url: tcp://127.0.0.1:6788
+  
+  # 关键修改：完全对齐MinkowskiNet的优化策略
+  base_lr: 0.0001  # 对齐mink.yaml的base_lr
+  loss_type: cosine # 保持余弦损失，与mink.yaml一致
+  loop: 5
+  epochs: 1000
+  start_epoch: 0
+  power: 0.9  # 对齐mink.yaml的多项式衰减参数
+  momentum: 0.9  # 对齐mink.yaml的动量设置
+  manual_seed: 1463
+  print_freq: 10
+  save_freq: 1
+  save_path: out/scannet_ptv3_aligned_optim
+  resume:
+  evaluate: True
+  eval_freq: 1
+  enable_flash: False  # 添加mink.yaml中的参数
+
+  # 移除PTV3特有的复杂优化器和调度器配置
+  # 不再使用AdamW和OneCycleLR，采用MinkowskiNet的简单策略
+  # 移除param_dicts配置，使用统一的优化参数
+
+TEST:
+  split: val
+  prompt_eng: True
+  mark_no_feature_to_unknown: True
+  feature_type: 'distill' # We are evaluating the distilled model
+  save_feature_as_numpy: False
+  vis_input: False
+  vis_pred: False
+  vis_gt: False
+  test_workers: 8
+  test_gpu: [0]
+  test_batch_size: 1
+  test_repeats: 5
+  model_path:
+  save_folder:
+
+Distributed:
+  dist_url: tcp://127.0.0.1:6788 
+  dist_backend: 'nccl'
+  multiprocessing_distributed: True
+  world_size: 1
+  rank: 0 
