@@ -6,38 +6,55 @@ DATA:
   classes: 20
   aug: True
   voxel_size: 0.02
-  input_color: False
+  input_color: True
   use_shm: False
-  
+
 DISTILL:
   arch_3d: PTV3Adapter
   ptv3_config: config/scannet/ptv3.py
+  in_channels: 3
+  pretrained_3d: /root/model_best.pth
   ignore_label: 255
-  train_gpu: [0,1,2,3]  
+  train_gpu: [0,1,2,3,4,5,6,7]  
   workers: 8  
-  batch_size: 16  
+  batch_size: 64  
   batch_size_val: 8  
   sync_bn: True
   multiprocessing_distributed: True
-  dist_url: tcp://127.0.0.1:6788
-  
-
+  dist_url: tcp://127.0.0.1:6789
   base_lr: 0.0001
   loss_type: cosine
   loop: 5
-  epochs: 100
+  epochs: 800
   start_epoch: 0
   power: 0.9
   momentum: 0.9
+  weight_decay: 0.01 
   manual_seed: 1463
   print_freq: 10
   save_freq: 1
-  save_path: out/scannet_ptv3_aligned_optim
-  resume:
+  save_path: out/scannet_ptv3_test 
+  resume: 
   evaluate: True
   eval_freq: 1
-  enable_flash: True
 
+  # Add optimizer and scheduler settings from PTV3's original config
+  optimizer:
+    type: "AdamW"
+    lr: 0.006
+    weight_decay: 0.05
+  
+  scheduler:
+    type: "OneCycleLR"
+    max_lr: [0.006, 0.0006]
+    pct_start: 0.05
+    anneal_strategy: "cos"
+    div_factor: 10.0
+    final_div_factor: 1000.0
+
+  param_dicts:
+    - keyword: "block"
+      lr: 0.0006
 
 TEST:
   split: val
@@ -52,12 +69,12 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path:
+  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_pretrained/model/model_best.pth.tar'
   save_folder:
 
 Distributed:
-  dist_url: tcp://127.0.0.1:6788
+  dist_url: tcp://127.0.0.1:6788 
   dist_backend: 'nccl'
-  multiprocessing_distributed: True
-  world_size: 1
-  rank: 0
+  multiprocessing_distributed: True 
+  world_size: 1  
+  rank: 0   

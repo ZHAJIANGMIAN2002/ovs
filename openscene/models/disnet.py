@@ -39,9 +39,15 @@ class DisNet(nn.Module):
             spec.loader.exec_module(ptv3_config_module)
             ptv3_cfg = ptv3_config_module.model
 
+            # Respect in_channels from ptv3 config (e.g., 3 for RGB or 6 for RGB+Normal)
+            requested_in_channels = ptv3_cfg.get('in_channels', None)
+            if requested_in_channels is None and hasattr(cfg, 'in_channels'):
+                # Allow overriding via YAML top-level (for visibility in config)
+                requested_in_channels = cfg.in_channels
+                ptv3_cfg['in_channels'] = requested_in_channels
             self.net3d = PTV3Adapter(
                 ptv3_cfg=ptv3_cfg,
-                in_channels=3,  # Pass the correct in_channels explicitly
+                in_channels=requested_in_channels,
                 voxel_size=cfg.voxel_size
             )
             

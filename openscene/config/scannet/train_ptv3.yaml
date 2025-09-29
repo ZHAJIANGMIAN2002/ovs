@@ -1,31 +1,25 @@
-# Inherit from a base config (we'll use settings from ours_lseg.yaml as a base)
-# Note: OpenScene's config system doesn't have a formal inheritance syntax in YAML.
-# We are conceptually inheriting by copying and modifying.
 
 DATA:
   data_root: data/scannet_3d
-  data_root_2d_fused_feature: data/scannet_openseg_features
+  data_root_2d_fused_feature: data/scannet_multiview_openseg
   feature_2d_extractor: openseg
   classes: 20
   aug: True
-  voxel_size: 0.05
-  input_color: False # Set to True to use RGB features
+  voxel_size: 0.035
+  input_color: True
   use_shm: False
 
 DISTILL:
-  # Key change: Specify the 3D architecture to be our PTV3 adapter
   arch_3d: PTV3Adapter
-  # Add a new key to point to the PTV3 specific python config file
   ptv3_config: config/scannet/ptv3.py
-  
   ignore_label: 255
-  train_gpu: [0, 1, 2]  # 使用4张GPU进行并行训练
-  workers: 12  # 每GPU 4个worker，总共16个
-  batch_size: 3  # 总batch_size=4，每GPU实际batch_size=1
-  batch_size_val: 3  # 验证batch_size=4，每GPU实际batch_size=1
-  sync_bn: True  # 启用同步BatchNorm
+  train_gpu: [0,1,2,3,4,5,6,7]  
+  workers: 8  
+  batch_size: 64  
+  batch_size_val: 8  
+  sync_bn: True
   multiprocessing_distributed: True
-  dist_url: tcp://127.0.0.1:6788
+  dist_url: tcp://127.0.0.1:6789
   base_lr: 0.0001
   loss_type: cosine
   loop: 5
@@ -33,11 +27,11 @@ DISTILL:
   start_epoch: 0
   power: 0.9
   momentum: 0.9
-  weight_decay: 0.01 # From PTV3 config
+  weight_decay: 0.01 
   manual_seed: 1463
   print_freq: 10
   save_freq: 1
-  save_path: out/scannet_ptv3_test # Specify a new output path
+  save_path: out/scannet_ptv3_test 
   resume:
   evaluate: True
   eval_freq: 1
@@ -73,12 +67,12 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/mnt/data2/jmzhou/openscene/scannet/model/model_best.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3/model/model_best.pth.tar'
   save_folder:
 
 Distributed:
   dist_url: tcp://127.0.0.1:6788 
   dist_backend: 'nccl'
-  multiprocessing_distributed: True # Ensure this is true for DDP
-  world_size: 1  # 单机多卡，world_size=1
-  rank: 0  # 主进程rank=0 
+  multiprocessing_distributed: True 
+  world_size: 1  
+  rank: 0   

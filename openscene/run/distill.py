@@ -159,26 +159,23 @@ def main_worker(gpu, ngpus_per_node, argss):
 
     # ####################### Optimizer ####################### #
     if hasattr(args, 'optimizer') and args.optimizer.type == 'AdamW':
+        # Build param groups without duplication: default group = all params minus special groups
+        special_groups = []
+        assigned_params: set = set()
         if hasattr(args, 'param_dicts'):
-            param_groups = []
             for p_dict in args.param_dicts:
                 keyword = p_dict['keyword']
-                params = [p for n, p in model.named_parameters() if keyword in n and p.requires_grad]
-                group_config = p_dict.copy()
-                del group_config['keyword']
-                group_config['params'] = params
-                param_groups.append(group_config)
-            
-            assigned_params = [p for group in param_groups for p in group['params']]
-            assigned_params_set = set(assigned_params)
-            default_params = [p for p in model.parameters() if p.requires_grad and p not in assigned_params_set]
-            
-            if default_params:
-                param_groups.append({'params': default_params})
-            param_dicts = param_groups
-        else:
-            param_dicts = filter(lambda p: p.requires_grad, model.parameters())
-        optimizer = torch.optim.AdamW(param_dicts, lr=args.optimizer.lr, weight_decay=args.optimizer.weight_decay)
+                special = [p for n, p in model.named_parameters() if keyword in n and p.requires_grad]
+                if len(special) == 0:
+                    continue
+                assigned_params.update(special)
+                group_config = {k: v for k, v in p_dict.items() if k != 'keyword'}
+                group_config['params'] = special
+                special_groups.append(group_config)
+
+        default_params = [p for p in model.parameters() if p.requires_grad and p not in assigned_params]
+        param_groups = [{'params': default_params}] + special_groups
+        optimizer = torch.optim.AdamW(param_groups, lr=args.optimizer.lr, weight_decay=args.optimizer.weight_decay)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=args.base_lr)
 
@@ -246,6 +243,17 @@ def main_worker(gpu, ngpus_per_node, argss):
             div_factor=args.scheduler.div_factor,
             final_div_factor=args.scheduler.final_div_factor
         )
+        # Print param groups and corresponding max_lr mapping for verification
+        if main_process():
+            try:
+                from pprint import pformat
+                print("OneCycle param_groups:")
+                for idx, g in enumerate(optimizer.param_groups):
+                    group_lr = g.get('lr', args.optimizer.lr)
+                    print(f"  group[{idx}] params={len(g['params'])} initial_lr={group_lr}")
+                print(f"OneCycle max_lr setting: {args.scheduler.max_lr}")
+            except Exception:
+                pass
 
     if args.evaluate:
         val_data = Point3DLoader(datapath_prefix=args.data_root,
@@ -308,6 +316,86 @@ def get_model(cfg):
     '''Get the 3D model.'''
 
     model = Model(cfg=cfg)
+
+    # Optionally load a pretrained 3D checkpoint (e.g., supervised PTV3)
+    if hasattr(cfg, 'pretrained_3d') and cfg.pretrained_3d:
+        ckpt_path = cfg.pretrained_3d
+        print(f"[pretrained_3d] Try loading: {ckpt_path}")
+        if os.path.isfile(ckpt_path):
+            try:
+                checkpoint = torch.load(ckpt_path, map_location='cpu')
+                if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                    state = checkpoint['state_dict']
+                else:
+                    state = checkpoint if isinstance(checkpoint, dict) else {}
+            except Exception as ex:
+                print(f"[pretrained_3d] Failed to load checkpoint: {ex}")
+                state = {}
+
+            msd = model.state_dict()
+            loaded, skipped, mismatched = 0, 0, 0
+
+            def candidate_keys(k: str):
+                # Generate a list of candidate names in current model for a ckpt key
+                names = []
+                n = k.replace('module.', '')
+                n = n.replace('model.', '').replace('segmentor.', '').replace('DefaultSegmentorV2.', '')
+                names.append(n)
+                # if contains backbone., map to net3d.backbone.*
+                if 'backbone.' in n:
+                    suf = n.split('backbone.', 1)[1]
+                    names.append('net3d.backbone.' + suf)
+                # direct net3d.*
+                names.append('net3d.' + n)
+                # direct (already prefixed) passthrough
+                return names
+
+            sample_print = 0
+            for k, v in state.items():
+                matched = False
+                for cand in candidate_keys(k):
+                    if cand in msd and msd[cand].shape == v.shape:
+                        msd[cand].copy_(v)
+                        loaded += 1
+                        if sample_print < 20:
+                            print(f"[pretrained_3d] + {k} -> {cand} {tuple(v.shape)}")
+                            sample_print += 1
+                        matched = True
+                        break
+                if not matched:
+                    # shape-mismatch diagnostics
+                    for cand in candidate_keys(k):
+                        if cand in msd and msd[cand].shape != getattr(v, 'shape', None):
+                            # Special-case: first conv 6->3 channel slice (spconv weight [out,kx,ky,kz,in])
+                            if (
+                                isinstance(v, torch.Tensor)
+                                and isinstance(msd[cand], torch.Tensor)
+                                and v.ndim == msd[cand].ndim == 5
+                                and v.shape[:-1] == msd[cand].shape[:-1]
+                                and v.shape[-1] > msd[cand].shape[-1]
+                                and ('stem.conv.weight' in k or 'stem.conv.weight' in cand)
+                            ):
+                                msd[cand].copy_(v[..., : msd[cand].shape[-1]])
+                                loaded += 1
+                                if sample_print < 20:
+                                    print(f"[pretrained_3d] ~ sliced load {k} -> {cand} {tuple(v.shape)} -> {tuple(msd[cand].shape)}")
+                                    sample_print += 1
+                                matched = True
+                                break
+                            mismatched += 1
+                            if sample_print < 20:
+                                print(f"[pretrained_3d] ! shape mismatch {k}->{cand}: ckpt {getattr(v,'shape',None)} vs model {msd[cand].shape}")
+                                sample_print += 1
+                            matched = True
+                            break
+                    if not matched:
+                        skipped += 1
+
+            model.load_state_dict(msd)
+            total = len(state)
+            print(f"[pretrained_3d] Loaded from {ckpt_path}: matched={loaded}, mismatched={mismatched}, skipped={skipped}, total_keys={total}")
+        else:
+            print(f"[pretrained_3d] File not found: {ckpt_path}")
     return model
 
 def obtain_text_features_and_palette():
@@ -371,18 +459,36 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
         data_time.update(time.time() - end)
 
         (coords, feat, label_3d, feat_3d, mask) = batch_data
-        coords[:, 1:4] += (torch.rand(3) * 100).type_as(coords)
+
+        # Light random translation while keeping integer coordinates
+        # coords[:, 1:4] += (torch.rand(3) * 100).type_as(coords)
+
+        # Move to GPU before building SparseTensor and sanitize fused 3D features
+        feat_3d = torch.nan_to_num(feat_3d, nan=0.0, posinf=1e4, neginf=-1e4)
         sinput = SparseTensor(
             feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
-        feat_3d, mask = feat_3d.cuda(
-            non_blocking=True), mask.cuda(non_blocking=True)
+        feat_3d, mask = feat_3d.cuda(non_blocking=True), mask.cuda(non_blocking=True)
 
         output_3d = model(sinput)
+        # Sanitize network outputs to prevent propagation of non-finite values
+        output_3d = torch.nan_to_num(output_3d, nan=0.0, posinf=1e4, neginf=-1e4)
         output_3d = output_3d[mask]
 
         if hasattr(args, 'loss_type') and args.loss_type == 'cosine':
-            loss = (1 - torch.nn.CosineSimilarity()
-                    (output_3d, feat_3d)).mean()
+            # Filter out invalid rows (zero targets or non-finite) to avoid 0/0 in cosine
+            with torch.no_grad():
+                valid_rows = (
+                    torch.isfinite(output_3d).all(dim=1)
+                    & torch.isfinite(feat_3d).all(dim=1)
+                    & (feat_3d.abs().sum(dim=1) > 0)
+                )
+            if valid_rows.any():
+                cosv = nn.functional.cosine_similarity(
+                    output_3d[valid_rows], feat_3d[valid_rows], dim=1, eps=1e-6
+                )
+                loss = (1 - cosv).mean()
+            else:
+                loss = torch.zeros((), device=output_3d.device, dtype=output_3d.dtype)
         elif hasattr(args, 'loss_type') and args.loss_type == 'l1':
             loss = torch.nn.L1Loss()(output_3d, feat_3d)
         else:
@@ -429,12 +535,13 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
                                                             loss_meter=loss_meter))
         if main_process():
             # writer.add_scalar('loss_train_batch', loss_meter.val, current_iter)
-            # writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], current_iter)
-            pass
+            writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], current_iter)
 
         end = time.time()
 
-    mask_first = (coords[mask][:, 0] == 0)
+    # Export: fix device mismatch by indexing with tensors on the same device as mask
+    coords_device = coords.to(mask.device, non_blocking=True) if isinstance(mask, torch.Tensor) else coords
+    mask_first = (coords_device[mask][:, 0] == 0)
     output_3d = output_3d[mask_first]
     feat_3d = feat_3d[mask_first]
     logits_pred = output_3d.half() @ text_features.t()
@@ -445,7 +552,7 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
     logits_gt = label_3d.numpy()[mask][mask_first.cpu().numpy()]
     logits_gt[logits_gt == 255] = args.classes
 
-    pcl = coords[:, 1:].cpu().numpy()
+    pcl = coords_device[:, 1:].detach().cpu().numpy()
 
     seg_label_color = convert_labels_with_palette(
         logits_img, palette)
@@ -484,10 +591,15 @@ def validate(val_loader, model, criterion):
                 feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
             label = label.cuda(non_blocking=True)
             output = model(sinput)
-            output = output[inds_reverse, :]
-            output = output.half() @ text_features.t()
-            loss = criterion(output, label)
-            output = torch.max(output, 1)[1]
+            output = output[inds_reverse, :].float()
+            text = text_features.float()
+            # Normalize features before computing logits to stabilize scale
+            output = nn.functional.normalize(output, dim=1)
+            text = nn.functional.normalize(text, dim=1)
+            logit_scale = 100.0
+            logits = (output @ text.t()) * logit_scale
+            loss = criterion(logits, label)
+            output = torch.max(logits, 1)[1]
 
             intersection, union, target = intersectionAndUnionGPU(output, label.detach(),
                                                                   args.classes, args.ignore_label)

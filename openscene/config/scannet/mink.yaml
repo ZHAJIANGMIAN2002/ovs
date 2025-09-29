@@ -1,6 +1,6 @@
 DATA:
   data_root: data/scannet_3d
-  data_root_2d_fused_feature: data/scannet_openseg_features
+  data_root_2d_fused_feature: data/scannet_multiview_openseg
   feature_2d_extractor: openseg
   classes: 20
   aug: True
@@ -11,22 +11,22 @@ DATA:
 DISTILL:
   arch_3d: MinkUNet18A
   ignore_label: 255
-  train_gpu: [0]
-  workers: 8  # data loader workers
-  batch_size: 4  # batch size for training
-  batch_size_val: 1  # batch size for validation during training, memory and speed tradeoff
+  train_gpu: [0, 1, 2, 3]  
+  workers: 8  
+  batch_size: 16  
+  batch_size_val: 8 
   base_lr: 0.0001
   loss_type: cosine # l1 | cosine
   loop: 5
-  epochs: 100
+  epochs: 200
   start_epoch: 0
   power: 0.9
   momentum: 0.9
   manual_seed: 1463
   print_freq: 10
   save_freq: 1
-  save_path:
-  resume:
+  save_path: out/scannet_mink
+  resume: /root/zjm/ovs/openscene/out/scannet_mink/model/model_best.pth.tar
   evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 1
 
@@ -44,7 +44,7 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/mnt/data2/jmzhou/openscene/scannet/model/model_best.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_mink/model/model_best.pth.tar'
   save_folder:
 
 Distributed:

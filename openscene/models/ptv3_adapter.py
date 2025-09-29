@@ -45,10 +45,10 @@ class PTV3Adapter(nn.Module):
         float_coords = grid_coord.float() * self.voxel_size
 
         # a batch of one scene
-        batch_indices = sampled_coords[:, 0]
-        # ptv3 need offsets
-        bincount = torch.bincount(batch_indices.long())
-        offsets = torch.cumsum(bincount, dim=0).int()
+        batch_indices = sampled_coords[:, 0].long()
+        # ptv3 need offsets (int64 expected by Pointcept utils)
+        bincount = torch.bincount(batch_indices)
+        offsets = torch.cumsum(bincount, dim=0).long()
 
         data_dict = {
             "coord": float_coords,

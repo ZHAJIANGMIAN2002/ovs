@@ -7,7 +7,11 @@ import numpy as np
 import torch
 from torch import nn
 from PIL import Image
-import open3d as o3d
+# import open3d as o3d
+try:
+    import open3d as o3d
+except (OSError, ImportError):
+    o3d = None
 import clip
 
 import matplotlib.patches as mpatches
@@ -45,23 +49,98 @@ def extract_clip_feature(labelset, model_name="ViT-B/32"):
 
     return text_features
 
+def _default_prompt_templates():
+    # Simple, domain-relevant templates; short to keep token budget low
+    return [
+        "{}",
+        "a {}",
+        "a {} in a scene",
+        "an indoor scene with a {}",
+        "a 3d scan of a {}"
+    ]
+
+def _build_synonyms_map_for_labels(labels, dataset_hint: str = ""):
+    # Minimal, safe synonyms; avoid synonyms equal to other class names to reduce confusion
+    base = {
+        "wall": ["wall", "interior wall"],
+        "floor": ["floor", "flooring"],
+        "cabinet": ["cabinet", "closet"],
+        "bed": ["bed", "bed furniture"],
+        "chair": ["chair", "armchair"],
+        "sofa": ["sofa", "couch"],
+        "table": ["table", "dining table"],
+        "door": ["door", "wooden door"],
+        "window": ["window", "glass window"],
+        "bookshelf": ["bookshelf", "bookcase"],
+        "picture": ["picture", "painting"],
+        "counter": ["counter", "kitchen counter"],
+        "desk": ["desk", "office desk"],
+        "curtain": ["curtain", "drapes"],
+        "refrigerator": ["refrigerator", "fridge"],
+        "shower curtain": ["shower curtain", "bath curtain"],
+        "toilet": ["toilet", "flush toilet"],
+        "sink": ["sink", "washbasin"],
+        "bathtub": ["bathtub", "bath tub"],
+        "other": ["other object"]
+    }
+
+    # Only keep entries that appear in current labels; fallback to the raw label otherwise
+    result = {}
+    for lab in labels:
+        key = lab.lower()
+        if key in base:
+            result[lab] = base[key]
+        else:
+            result[lab] = [lab]
+    return result
+
+def extract_clip_feature_with_templates(labels, model_name="ViT-B/32", templates=None, synonyms_map=None):
+    print("Loading CLIP {} model...".format(model_name))
+    clip_pretrained, _ = clip.load(model_name, device='cuda', jit=False)
+    print("Finish loading")
+
+    if templates is None:
+        templates = _default_prompt_templates()
+
+    class_features = []
+    for label in labels:
+        synonyms = [label]
+        if isinstance(synonyms_map, dict) and label in synonyms_map:
+            synonyms = synonyms_map[label]
+
+        prompts = [t.format(s) for s in synonyms for t in templates]
+        text = clip.tokenize(prompts).cuda()
+        with torch.no_grad():
+            feats = clip_pretrained.encode_text(text)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        # Average then re-normalize per class (Prompt Ensemble)
+        feat_mean = feats.mean(dim=0, keepdim=True)
+        feat_mean = feat_mean / feat_mean.norm(dim=-1, keepdim=True)
+        class_features.append(feat_mean)
+
+    text_features = torch.cat(class_features, dim=0)
+    return text_features
+
 def extract_text_feature(labelset, args):
     '''extract CLIP text features.'''
 
-    # a bit of prompt engineering
-    if hasattr(args, 'prompt_eng') and args.prompt_eng:
-        print('Use prompt engineering: a XX in a scene')
-        labelset = [ "a " + label + " in a scene" for label in labelset]
+    # Prompt engineering with simple, robust ensembling
+    use_prompt_eng = hasattr(args, 'prompt_eng') and args.prompt_eng
+    model_name = "ViT-B/32" if 'lseg' in args.feature_2d_extractor else "ViT-L/14@336px"
+
+    if use_prompt_eng:
         if 'scannet_3d' in args.data_root:
+            labelset = list(labelset)
             labelset[-1] = 'other'
         if 'matterport_3d' in args.data_root:
+            labelset = list(labelset)
             labelset[-2] = 'other'
-    if 'lseg' in args.feature_2d_extractor:
-        text_features = extract_clip_feature(labelset)
-    elif 'openseg' in args.feature_2d_extractor:
-        text_features = extract_clip_feature(labelset, model_name="ViT-L/14@336px")
+
+        templates = _default_prompt_templates()
+        synonyms_map = _build_synonyms_map_for_labels(labelset, dataset_hint=args.data_root if hasattr(args, 'data_root') else "")
+        text_features = extract_clip_feature_with_templates(labelset, model_name=model_name, templates=templates, synonyms_map=synonyms_map)
     else:
-        raise NotImplementedError
+        text_features = extract_clip_feature(labelset, model_name=model_name)
 
     return text_features
 
@@ -155,6 +234,8 @@ def check_makedirs(dir_name):
         os.makedirs(dir_name)
 
 def export_pointcloud(name, points, colors=None, normals=None):
+    if o3d is None:
+        return
     if len(points.shape) > 2:
         points = points[0]
         if normals is not None:
@@ -172,6 +253,8 @@ def export_pointcloud(name, points, colors=None, normals=None):
     o3d.io.write_point_cloud(name, pcd)
 
 def export_mesh(name, v, f, c=None):
+    if o3d is None:
+        return
     if len(v.shape) > 2:
         v, f = v[0], f[0]
     if isinstance(v, torch.Tensor):
