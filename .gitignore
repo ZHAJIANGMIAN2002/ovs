@@ -17,3 +17,7 @@ env/
 # IDE files
 .vscode/
 .idea/*.pth.tar
+# Ignore third-party library source code
+/flash-attention/
+openscene/MinkowskiEngine/
+*.whl
