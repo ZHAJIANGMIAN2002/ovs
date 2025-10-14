@@ -55,7 +55,15 @@ class DisNet(nn.Module):
             # From the PTV3 config: dec_channels=(64, 64, 128, 256)
             # The unpooling starts from enc_channels[-1] (512) -> dec_channels[-1] (256) -> ... -> dec_channels[0] (64)
             ptv3_out_dim = ptv3_cfg['dec_channels'][0]
-            self.projection_head = nn.Linear(ptv3_out_dim, last_dim)
+
+            # Build a configurable projection head. Default remains a single Linear layer
+            # for backward compatibility. If cfg.proj_head is provided and type=="mlp",
+            # we use a 2-layer MLP: [LayerNorm] -> Linear(in, hidden) -> GELU -> [Dropout] -> Linear(hidden, out)
+            self.projection_head = self._build_projection_head(
+                input_dim=ptv3_out_dim,
+                output_dim=last_dim,
+                cfg=cfg
+            )
             
         else:
             # Original MinkowskiNet for 3D point clouds
@@ -69,3 +77,57 @@ class DisNet(nn.Module):
         if self.projection_head:
             x = self.projection_head(x)
         return x
+
+    def _build_projection_head(self, input_dim: int, output_dim: int, cfg):
+        """Create projection head module based on config.
+
+        Accepted cfg fields (all optional):
+          - proj_head.type: "linear" | "mlp" (default: "linear" for backward compatibility)
+          - proj_head.hidden_dim: int (default: 256 when type=="mlp")
+          - proj_head.dropout: float in [0,1] (default: 0.1 when type=="mlp")
+          - proj_head.use_ln: bool (default: True when type=="mlp")
+          - proj_head.pre_expand_dim: int (optional). If > input_dim, insert a Linear(input_dim->pre_expand_dim)
+          - proj_head.pre_expand_act: bool (default: False). If True, add GELU after pre-expand
+        """
+        proj_cfg = getattr(cfg, 'proj_head', None)
+
+        def _get(container, key, default):
+            if container is None:
+                return default
+            if isinstance(container, dict):
+                return container.get(key, default)
+            return getattr(container, key, default)
+
+        proj_type = _get(proj_cfg, 'type', 'linear')
+        if isinstance(proj_type, str) and proj_type.lower() == 'mlp':
+            hidden_dim = int(_get(proj_cfg, 'hidden_dim', 256))
+            dropout_p = float(_get(proj_cfg, 'dropout', 0.1))
+            use_ln = bool(_get(proj_cfg, 'use_ln', True))
+            pre_expand_dim = _get(proj_cfg, 'pre_expand_dim', None)
+            pre_expand_act = bool(_get(proj_cfg, 'pre_expand_act', False))
+
+            layers = []
+            if use_ln:
+                layers.append(nn.LayerNorm(input_dim))
+            # Optional pre-expansion: Linear(input_dim -> pre_expand_dim)
+            effective_in = input_dim
+            if pre_expand_dim is not None:
+                try:
+                    ped = int(pre_expand_dim)
+                except Exception:
+                    ped = None
+                if ped is not None and ped > input_dim:
+                    layers.append(nn.Linear(input_dim, ped))
+                    if pre_expand_act:
+                        layers.append(nn.GELU())
+                    effective_in = ped
+
+            layers.append(nn.Linear(effective_in, hidden_dim))
+            layers.append(nn.GELU())
+            if dropout_p and dropout_p > 0:
+                layers.append(nn.Dropout(dropout_p))
+            layers.append(nn.Linear(hidden_dim, output_dim))
+            return nn.Sequential(*layers)
+
+        # default: single Linear to keep previous behavior
+        return nn.Linear(input_dim, output_dim)

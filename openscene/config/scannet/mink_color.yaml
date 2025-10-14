@@ -5,13 +5,13 @@ DATA:
   classes: 20
   aug: True
   voxel_size: 0.02
-  input_color: False
+  input_color: True
   use_shm: False
   
 DISTILL:
   arch_3d: MinkUNet18A
   ignore_label: 255
-  train_gpu: [0, 1, 2, 3, 7]  
+  train_gpu: [0, 1, 2, 3, 4, 5, 6, 7]  
   workers: 8  
   batch_size: 16  
   batch_size_val: 8 
@@ -26,10 +26,9 @@ DISTILL:
   print_freq: 10
   save_freq: 1
   save_path: out/scannet_mink
-  resume: 
+  resume: /root/zjm/ovs/openscene/out/scannet_mink_color/model/model_best.pth.tar
   evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 1
-
 
 
 TEST:
@@ -45,7 +44,7 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_mink/model/model_last.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_mink_color/model/model_best.pth.tar'
   save_folder:
 
 Distributed:
