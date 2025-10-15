@@ -67,47 +67,6 @@ def extract_openseg_img_feature(img_dir, openseg_model, text_emb, img_size=None,
 
     return feat_2d
 
-
-def extract_openseg_img_feature2(img_dir, openseg_model, text_emb, img_size=None, regional_pool=True):
-    '''
-    Extract per-pixel OpenSeg features with improved precision.
-    
-    Improvements over extract_openseg_img_feature:
-    - Uses FP32 instead of FP16 (preserves numerical precision)
-    - Uses bilinear interpolation instead of nearest neighbor (smoother features)
-    '''
-
-    # load RGB image
-    np_image_string = read_bytes(img_dir)
-    # run OpenSeg
-    results = openseg_model.signatures['serving_default'](
-            inp_image_bytes=tf.convert_to_tensor(np_image_string),
-            inp_text_emb=text_emb)
-    img_info = results['image_info']
-    crop_sz = [
-        int(img_info[0, 0] * img_info[2, 0]),
-        int(img_info[0, 1] * img_info[2, 1])
-    ]
-    if regional_pool:
-        image_embedding_feat = results['ppixel_ave_feat'][:, :crop_sz[0], :crop_sz[1]]
-    else:
-        image_embedding_feat = results['image_embedding_feat'][:, :crop_sz[0], :crop_sz[1]]
-    
-    if img_size is not None:
-        # Use bilinear interpolation for smoother features
-        feat_2d = tf.image.resize_bilinear(
-            image_embedding_feat, img_size, align_corners=True
-        )[0]
-        # Keep FP32 precision
-        feat_2d = tf.cast(feat_2d, dtype=tf.float32).numpy()
-    else:
-        # Keep FP32 precision
-        feat_2d = tf.cast(image_embedding_feat[0], dtype=tf.float32).numpy()
-
-    feat_2d = torch.from_numpy(feat_2d).permute(2, 0, 1)
-
-    return feat_2d
-
 def save_fused_feature(feat_bank, point_ids, n_points, out_dir, scene_id, args):
     '''Save features.'''
 
@@ -129,33 +88,6 @@ def save_fused_feature(feat_bank, point_ids, n_points, out_dir, scene_id, args):
                     "mask_full": mask_entire
         },  os.path.join(out_dir, scene_id +'_%d.pt'%(n)))
         print(os.path.join(out_dir, scene_id +'_%d.pt'%(n)) + ' is saved!')
-
-
-def save_fused_feature_fp32(feat_bank, point_ids, n_points, out_dir, scene_id, args):
-    '''
-    Save features in FP32 precision (no .half() conversion).
-    Doubles storage but preserves numerical precision.
-    '''
-
-    for n in range(args.num_rand_file_per_scene):
-        if n_points < args.n_split_points:
-            n_points_cur = n_points
-        else:
-            n_points_cur = args.n_split_points
-
-        rand_ind = np.random.choice(range(n_points), n_points_cur, replace=False)
-
-        mask_entire = torch.zeros(n_points, dtype=torch.bool)
-        mask_entire[rand_ind] = True
-        mask = torch.zeros(n_points, dtype=torch.bool)
-        mask[point_ids] = True
-        mask_entire = mask_entire & mask
-
-        # Save as FP32 (no .half())
-        torch.save({"feat": feat_bank[mask_entire].cpu(),
-                    "mask_full": mask_entire
-        },  os.path.join(out_dir, scene_id +'_%d.pt'%(n)))
-        print(os.path.join(out_dir, scene_id +'_%d.pt'%(n)) + ' is saved (FP32)!')
 
 
 class PointCloudToImageMapper(object):

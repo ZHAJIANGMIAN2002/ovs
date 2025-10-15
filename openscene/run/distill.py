@@ -19,7 +19,7 @@ from MinkowskiEngine import SparseTensor
 from util import config
 from util.util import AverageMeter, intersectionAndUnionGPU, \
     poly_learning_rate, save_checkpoint, \
-    export_pointcloud, get_palette, convert_labels_with_palette, extract_clip_feature
+    export_pointcloud, get_palette, convert_labels_with_palette, extract_clip_feature, extract_text_feature
 from dataset.label_constants import *
 from dataset.feature_loader import FusedFeatureLoader, collation_fn
 from dataset.point_loader import Point3DLoader, collation_fn_eval_all
@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 
 best_iou = 0.0
+top_k_checkpoints = []  # List of (epoch, mIoU) tuples for top-k models
 
 
 def worker_init_fn(worker_id):
@@ -131,6 +132,7 @@ def main():
 def main_worker(gpu, ngpus_per_node, argss):
     global args
     global best_iou
+    global top_k_checkpoints
     args = argss
 
     if args.distributed:
@@ -203,6 +205,9 @@ def main_worker(gpu, ngpus_per_node, argss):
             model.load_state_dict(checkpoint['state_dict'], strict=True)
             optimizer.load_state_dict(checkpoint['optimizer'])
             best_iou = checkpoint['best_iou']
+            # Load top-k checkpoints list if available
+            if 'top_k_checkpoints' in checkpoint:
+                top_k_checkpoints = checkpoint['top_k_checkpoints']
             if main_process():
                 logger.info("=> loaded checkpoint '{}' (epoch {})".format(
                     args.resume, checkpoint['epoch']))
@@ -284,6 +289,7 @@ def main_worker(gpu, ngpus_per_node, argss):
             writer.add_scalar('loss_train', loss_train, epoch_log)
 
         is_best = False
+        is_top_k = False
         if args.evaluate and (epoch_log % args.eval_freq == 0):
             loss_val, mIoU_val, mAcc_val, allAcc_val = validate(
                 val_loader, model, criterion)
@@ -297,19 +303,52 @@ def main_worker(gpu, ngpus_per_node, argss):
                 # remember best iou and save checkpoint
                 is_best = mIoU_val > best_iou
                 best_iou = max(best_iou, mIoU_val)
+                
+                # Update top-k checkpoints list (keep top-3)
+                K = 3
+                top_k_checkpoints.append((epoch_log, mIoU_val))
+                # Sort by mIoU descending, then by epoch descending (prefer later epochs if tied)
+                top_k_checkpoints.sort(key=lambda x: (-x[1], -x[0]))
+                # Keep only top-K
+                top_k_checkpoints[:] = top_k_checkpoints[:K]
+                
+                # Check if current epoch is in top-k
+                is_top_k = any(ep == epoch_log for ep, _ in top_k_checkpoints)
+                
+                logger.info('Top-{} checkpoints: {}'.format(
+                    K, [(ep, f'{iou:.4f}') for ep, iou in top_k_checkpoints]))
 
         if (epoch_log % args.save_freq == 0) and main_process():
+            # Always save model_last.pth.tar
+            checkpoint_dict = {
+                'epoch': epoch_log,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_iou': best_iou,
+                'top_k_checkpoints': top_k_checkpoints
+            }
             save_checkpoint(
-                {
-                    'epoch': epoch_log,
-                    'state_dict': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'best_iou': best_iou
-                }, is_best, os.path.join(args.save_path, 'model')
+                checkpoint_dict, is_best, os.path.join(args.save_path, 'model')
             )
+            
+            # Additionally save top-k checkpoints with unique names
+            if is_top_k and args.evaluate:
+                # Find the rank of current epoch in top-k
+                for rank, (ep, iou) in enumerate(top_k_checkpoints, 1):
+                    if ep == epoch_log:
+                        # Save as model_best_rank{rank}.pth.tar
+                        topk_filename = f'model_best_rank{rank}.pth.tar'
+                        topk_path = os.path.join(args.save_path, 'model', topk_filename)
+                        torch.save(checkpoint_dict, topk_path)
+                        logger.info(f'Saved top-{rank} checkpoint: epoch {epoch_log}, mIoU {iou:.4f}')
+                        break
     if main_process():
         writer.close()
         logger.info('==>Training done!\nBest Iou: %.3f' % (best_iou))
+        if top_k_checkpoints:
+            logger.info('Top-3 checkpoints saved:')
+            for rank, (ep, iou) in enumerate(top_k_checkpoints, 1):
+                logger.info('  Rank {}: Epoch {} - mIoU {:.4f}'.format(rank, ep, iou))
 
 
 def get_model(cfg):
@@ -415,27 +454,8 @@ def obtain_text_features_and_palette():
         palette = get_palette(colormap='nuscenes16')
         dataset_name = 'nuscenes'
 
-    if not os.path.exists('saved_text_embeddings'):
-        os.makedirs('saved_text_embeddings')
-
-    if 'openseg' in args.feature_2d_extractor:
-        model_name="ViT-L/14@336px"
-        postfix = '_768' # the dimension of CLIP features is 768
-    elif 'lseg' in args.feature_2d_extractor:
-        model_name="ViT-B/32"
-        postfix = '_512' # the dimension of CLIP features is 512
-    else:
-        raise NotImplementedError
-
-    clip_file_name = 'saved_text_embeddings/clip_{}_labels{}.pt'.format(dataset_name, postfix)
-
-    try: # try to load the pre-saved embedding first
-        logger.info('Load pre-computed embeddings from {}'.format(clip_file_name))
-        text_features = torch.load(clip_file_name).cuda()
-    except: # extract CLIP text features and save them
-        text_features = extract_clip_feature(labelset, model_name=model_name)
-        torch.save(text_features, clip_file_name)
-
+    # Use the same text feature pipeline as inference (supports prompt_eng)
+    text_features = extract_text_feature(labelset, args)
     return text_features, palette
 
 
@@ -584,6 +604,10 @@ def validate(val_loader, model, criterion):
     # obtain the CLIP feature
     text_features, _ = obtain_text_features_and_palette()
 
+    # Ensure evaluation mode (affects BatchNorm/Dropout)
+    was_training = model.training
+    model.eval()
+
     with torch.no_grad():
         for batch_data in tqdm(val_loader):
             (coords, feat, label, inds_reverse) = batch_data
@@ -593,12 +617,9 @@ def validate(val_loader, model, criterion):
             output = model(sinput)
             output = output[inds_reverse, :].float()
             text = text_features.float()
-            # Normalize features before computing logits to stabilize scale
-            output = nn.functional.normalize(output, dim=1)
-            text = nn.functional.normalize(text, dim=1)
-            logit_scale = 100.0
-            logits = (output @ text.t()) * logit_scale
-            loss = criterion(logits, label)
+            # Align with inference (distill branch): no L2 normalization, no fixed scaling
+            logits = (output.half() @ text.t())
+            loss = criterion(logits.float(), label)
             output = torch.max(logits, 1)[1]
 
             intersection, union, target = intersectionAndUnionGPU(output, label.detach(),
@@ -621,6 +642,9 @@ def validate(val_loader, model, criterion):
     if main_process():
         logger.info(
             'Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(mIoU, mAcc, allAcc))
+    # Restore training mode
+    if was_training:
+        model.train()
     return loss_meter.avg, mIoU, mAcc, allAcc
 
 
