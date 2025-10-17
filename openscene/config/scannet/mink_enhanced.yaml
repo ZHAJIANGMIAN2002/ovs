@@ -1,0 +1,57 @@
+DATA:
+  data_root: data/scannet_3d
+  data_root_2d_fused_feature: data/scannet_multiview_openseg_pe3
+  feature_2d_extractor: openseg
+  classes: 20
+  aug: True
+  voxel_size: 0.02
+  input_color: False
+  use_shm: False
+  
+DISTILL:
+  arch_3d: MinkUNet18A
+  ignore_label: 255
+  train_gpu: [0, 1, 2, 3]
+  workers: 8  
+  batch_size: 16
+  batch_size_val: 8 
+  base_lr: 0.0001
+  loss_type: cosine
+  loop: 5
+  epochs: 100
+  start_epoch: 0
+  power: 0.9
+  momentum: 0.9
+  manual_seed: 1463
+  print_freq: 10
+  save_freq: 1
+  save_path: exp/scannet_mink_enhanced
+  resume: 
+  evaluate: True
+  eval_freq: 1
+  # Enhanced prompts configuration
+  use_enhanced_prompts: True  # Use multi-dimensional descriptions for training
+
+TEST:
+  split: val
+  prompt_eng: True  # Testing still uses baseline "a XX in a scene"
+  mark_no_feature_to_unknown: True
+  feature_type: 'ensemble'
+  save_feature_as_numpy: False
+  vis_input: False
+  vis_pred: False
+  vis_gt: False
+  test_workers: 8
+  test_gpu: [4]
+  test_batch_size: 1
+  test_repeats: 5
+  model_path: 'exp/scannet_mink_enhanced/model/model_best.pth.tar'
+  save_folder:
+
+Distributed:
+  dist_url: tcp://127.0.0.1:6789
+  dist_backend: 'nccl'
+  multiprocessing_distributed: True
+  world_size: 1
+  rank: 0
+

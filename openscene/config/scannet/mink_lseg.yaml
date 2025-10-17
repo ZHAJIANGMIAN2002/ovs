@@ -1,7 +1,7 @@
 DATA:
   data_root: data/scannet_3d
-  data_root_2d_fused_feature: data/scannet_multiview_openseg_pe3
-  feature_2d_extractor: openseg
+  data_root_2d_fused_feature: data/scannet_multiview_lseg
+  feature_2d_extractor: lseg
   classes: 20
   aug: True
   voxel_size: 0.02
@@ -11,11 +11,11 @@ DATA:
 DISTILL:
   arch_3d: MinkUNet18A
   ignore_label: 255
-  train_gpu: [0, 1, 2, 3]  # Match baseline: 4 GPUs
+  train_gpu: [0, 1, 2, 3, 4, 5]  
   workers: 8  
-  batch_size: 16  # Match baseline: global batch 16
+  batch_size: 18  
   batch_size_val: 8 
-  base_lr: 0.0001  # Match baseline exactly
+  base_lr: 0.0001
   loss_type: cosine # l1 | cosine
   loop: 5
   epochs: 100
@@ -25,12 +25,10 @@ DISTILL:
   manual_seed: 1463
   print_freq: 10
   save_freq: 1
-  save_path: 
+  save_path: out/scannet_mink
   resume: 
   evaluate: True  # evaluate on validation set, extra gpu memory needed and small batch_size_val is recommend
   eval_freq: 1
-  # Enhanced prompts for training (validation/testing use baseline for fair comparison)
-  use_enhanced_prompts: True  # Set to True to enable multi-dimensional enhanced descriptions
 
 
 
@@ -44,10 +42,10 @@ TEST:
   vis_pred: False
   vis_gt: False
   test_workers: 8
-  test_gpu: [4]
+  test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_mink_pe3_2/model/model_best.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_mink_lseg/model/model_best.pth.tar'
   save_folder:
 
 Distributed:

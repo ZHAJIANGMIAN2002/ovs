@@ -182,6 +182,7 @@ def main_worker(gpu, ngpus_per_node, argss):
         optimizer = torch.optim.Adam(model.parameters(), lr=args.base_lr)
 
     scheduler = None
+    resume_scheduler_state = None
     args.index_split = 0
 
     if args.distributed:
@@ -205,6 +206,8 @@ def main_worker(gpu, ngpus_per_node, argss):
             model.load_state_dict(checkpoint['state_dict'], strict=True)
             optimizer.load_state_dict(checkpoint['optimizer'])
             best_iou = checkpoint['best_iou']
+            # Cache scheduler state if available; we'll restore it after creating the scheduler
+            resume_scheduler_state = checkpoint.get('scheduler', None)
             # Load top-k checkpoints list if available
             if 'top_k_checkpoints' in checkpoint:
                 top_k_checkpoints = checkpoint['top_k_checkpoints']
@@ -238,6 +241,11 @@ def main_worker(gpu, ngpus_per_node, argss):
 
     # Create scheduler after train_loader is created
     if hasattr(args, 'scheduler') and args.scheduler.type == 'OneCycleLR':
+        # Infer last_epoch when resuming without an explicit scheduler state in the checkpoint
+        inferred_last_epoch = -1
+        if args.resume and resume_scheduler_state is None and args.start_epoch > 0:
+            inferred_last_epoch = args.start_epoch * len(train_loader) - 1
+
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=args.scheduler.max_lr,
@@ -246,8 +254,18 @@ def main_worker(gpu, ngpus_per_node, argss):
             pct_start=args.scheduler.pct_start,
             anneal_strategy=args.scheduler.anneal_strategy,
             div_factor=args.scheduler.div_factor,
-            final_div_factor=args.scheduler.final_div_factor
+            final_div_factor=args.scheduler.final_div_factor,
+            last_epoch=inferred_last_epoch
         )
+
+        # If we have an explicit scheduler state, load it to continue from exact step
+        if resume_scheduler_state is not None:
+            try:
+                scheduler.load_state_dict(resume_scheduler_state)
+            except Exception as e:
+                if main_process():
+                    print(f"[resume] Failed to load scheduler state ({e}); fall back to inferred last_epoch={inferred_last_epoch}.")
+                scheduler.last_epoch = inferred_last_epoch
         # Print param groups and corresponding max_lr mapping for verification
         if main_process():
             try:
@@ -327,21 +345,56 @@ def main_worker(gpu, ngpus_per_node, argss):
                 'best_iou': best_iou,
                 'top_k_checkpoints': top_k_checkpoints
             }
+            if scheduler is not None:
+                try:
+                    checkpoint_dict['scheduler'] = scheduler.state_dict()
+                except Exception:
+                    pass
             save_checkpoint(
                 checkpoint_dict, is_best, os.path.join(args.save_path, 'model')
             )
             
-            # Additionally save top-k checkpoints with unique names
-            if is_top_k and args.evaluate:
-                # Find the rank of current epoch in top-k
-                for rank, (ep, iou) in enumerate(top_k_checkpoints, 1):
-                    if ep == epoch_log:
-                        # Save as model_best_rank{rank}.pth.tar
-                        topk_filename = f'model_best_rank{rank}.pth.tar'
-                        topk_path = os.path.join(args.save_path, 'model', topk_filename)
-                        torch.save(checkpoint_dict, topk_path)
-                        logger.info(f'Saved top-{rank} checkpoint: epoch {epoch_log}, mIoU {iou:.4f}')
-                        break
+            # Synchronize Top-K checkpoint files: always rewrite rank1..K based on latest list
+            if args.evaluate and top_k_checkpoints:
+                try:
+                    K = min(3, len(top_k_checkpoints))
+                    model_dir = os.path.join(args.save_path, 'model')
+                    desired_epochs = [ep for ep, _ in top_k_checkpoints[:K]]
+
+                    # Build mapping from epoch -> checkpoint content
+                    epoch_to_ckpt = {}
+                    # Prefer current epoch's in-memory checkpoint when applicable
+                    if epoch_log in desired_epochs:
+                        epoch_to_ckpt[epoch_log] = checkpoint_dict
+
+                    # Load existing rank files to recover other epochs' checkpoints
+                    for existing_rank in range(1, K + 1):
+                        existing_path = os.path.join(model_dir, f'model_best_rank{existing_rank}.pth.tar')
+                        if not os.path.isfile(existing_path):
+                            continue
+                        try:
+                            ckpt = torch.load(existing_path, map_location='cpu')
+                            ep_saved = ckpt.get('epoch', None)
+                            if ep_saved in desired_epochs and ep_saved not in epoch_to_ckpt:
+                                # Update embedded top-k list to the latest for consistency
+                                ckpt['top_k_checkpoints'] = top_k_checkpoints
+                                epoch_to_ckpt[ep_saved] = ckpt
+                        except Exception:
+                            pass
+
+                    # Rewrite rank files according to latest ordering
+                    for rank, (ep, iou) in enumerate(top_k_checkpoints[:K], 1):
+                        topk_path = os.path.join(model_dir, f'model_best_rank{rank}.pth.tar')
+                        ckpt_to_save = epoch_to_ckpt.get(ep, None)
+                        if ckpt_to_save is None:
+                            logger.info(f'[TopK] Missing checkpoint for epoch {ep}; skip writing rank {rank}.')
+                            continue
+                        # Ensure metadata reflects latest ordering
+                        ckpt_to_save['top_k_checkpoints'] = top_k_checkpoints
+                        torch.save(ckpt_to_save, topk_path)
+                    logger.info(f'Synchronized Top-{K} checkpoint files: {[(ep, f"{iou:.4f}") for ep, iou in top_k_checkpoints[:K]]}')
+                except Exception as e:
+                    logger.info(f'[TopK] Synchronization skipped due to error: {e}')
     if main_process():
         writer.close()
         logger.info('==>Training done!\nBest Iou: %.3f' % (best_iou))
@@ -615,10 +668,10 @@ def validate(val_loader, model, criterion):
                 feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
             label = label.cuda(non_blocking=True)
             output = model(sinput)
-            output = output[inds_reverse, :].float()
-            text = text_features.float()
-            # Align with inference (distill branch): no L2 normalization, no fixed scaling
-            logits = (output.half() @ text.t())
+            output = output[inds_reverse, :]
+            text = text_features
+            # Align with inference: use half precision on both sides, no normalization or scaling
+            logits = (output.half() @ text.half().t())
             loss = criterion(logits.float(), label)
             output = torch.max(logits, 1)[1]
 

@@ -1,6 +1,6 @@
 DATA:
   data_root: data/scannet_3d
-  data_root_2d_fused_feature: data/scannet_multiview_openseg_pe3
+  data_root_2d_fused_feature: data/scannet_multiview_openseg
   feature_2d_extractor: openseg
   classes: 20
   aug: True
@@ -44,10 +44,10 @@ TEST:
   vis_pred: False
   vis_gt: False
   test_workers: 8
-  test_gpu: [4]
+  test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_mink_pe3_2/model/model_best.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_mink_prompt/model/model_last.pth.tar'
   save_folder:
 
 Distributed:

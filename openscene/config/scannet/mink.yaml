@@ -1,7 +1,7 @@
 DATA:
   data_root: data/scannet_3d
-  data_root_2d_fused_feature: data/scannet_multiview_openseg
-  feature_2d_extractor: openseg
+  data_root_2d_fused_feature: data/scannet_multiview_lseg
+  feature_2d_extractor: lseg
   classes: 20
   aug: True
   voxel_size: 0.02
@@ -11,14 +11,14 @@ DATA:
 DISTILL:
   arch_3d: MinkUNet18A
   ignore_label: 255
-  train_gpu: [0, 1, 2, 3, 7]  
+  train_gpu: [0, 1, 2, 3]  
   workers: 8  
   batch_size: 16  
   batch_size_val: 8 
   base_lr: 0.0001
   loss_type: cosine # l1 | cosine
   loop: 5
-  epochs: 200
+  epochs: 100
   start_epoch: 0
   power: 0.9
   momentum: 0.9
@@ -45,7 +45,7 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_mink/model/model_last.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_mink1/model/model_best.pth.tar'
   save_folder:
 
 Distributed:

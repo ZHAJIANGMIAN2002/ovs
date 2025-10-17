@@ -4,7 +4,7 @@
 # model settings
 model = dict(
     type="PT-v3m1",
-    in_channels=3,  # Input channels: xyz coordinates (no RGB color)
+    in_channels=3,  
     order=("z", "z-trans", "hilbert", "hilbert-trans"),
     stride=(2, 2, 2, 2),
     enc_depths=(2, 2, 2, 6, 2),
