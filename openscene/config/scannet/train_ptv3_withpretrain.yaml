@@ -76,7 +76,7 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg2/model/model_best_rank3.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg2/model/model_best_rank1.pth.tar'
   save_folder:
 
 Distributed:

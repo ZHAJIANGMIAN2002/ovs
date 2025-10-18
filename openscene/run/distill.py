@@ -24,6 +24,7 @@ from dataset.label_constants import *
 from dataset.feature_loader import FusedFeatureLoader, collation_fn
 from dataset.point_loader import Point3DLoader, collation_fn_eval_all
 from models.disnet import DisNet as Model
+from models.petr_pe import TeacherPETRPEHead
 from tqdm import tqdm
 
 
@@ -135,6 +136,16 @@ def main_worker(gpu, ngpus_per_node, argss):
     global top_k_checkpoints
     args = argss
 
+    # Set CUDA device EARLY to ensure all modules are created on the correct GPU
+    try:
+        if args.distributed:
+            torch.cuda.set_device(gpu)
+        else:
+            dev0 = args.train_gpu[0] if isinstance(args.train_gpu, (list, tuple)) else int(args.train_gpu)
+            torch.cuda.set_device(dev0)
+    except Exception:
+        pass
+
     if args.distributed:
         if args.multiprocessing_distributed:
             args.rank = args.rank * ngpus_per_node + gpu
@@ -160,6 +171,46 @@ def main_worker(gpu, ngpus_per_node, argss):
             print("=> Successfully converted model to use synchronized BatchNorm")
 
     # ####################### Optimizer ####################### #
+    # Build TeacherPETRPEHead (online & ema) early so its params are part of optimizer & scheduler
+    petr_cfg_early = getattr(args, 'TEACHER_PETRPE', None)
+    if petr_cfg_early is not None:
+        pe_enable = getattr(petr_cfg_early, 'enable', False)
+        pe_use_fpe = getattr(petr_cfg_early, 'use_fpe', True)
+        pe_lambda = getattr(petr_cfg_early, 'lambda_pe', 1.0)
+        pe_ema_m = getattr(petr_cfg_early, 'ema_m', 0.996)
+        pe_head_w = getattr(petr_cfg_early, 'head_loss_weight', 0.1)
+        pe_pc_range = getattr(petr_cfg_early, 'pc_range', None)
+        pe_debug = getattr(petr_cfg_early, 'debug', False)
+        pe_embed_dim = getattr(petr_cfg_early, 'embed_dim', 512)
+    else:
+        # flattened fallback
+        pe_enable = getattr(args, 'enable', False)
+        pe_use_fpe = getattr(args, 'use_fpe', True)
+        pe_lambda = getattr(args, 'lambda_pe', 1.0)
+        pe_ema_m = getattr(args, 'ema_m', 0.996)
+        pe_head_w = getattr(args, 'head_loss_weight', 0.1)
+        pe_pc_range = getattr(args, 'pc_range', None)
+        pe_debug = getattr(args, 'debug', False)
+        pe_embed_dim = getattr(args, 'embed_dim', 512)
+    # Cache EMA hyperparams on args
+    args._petrpe_ema_m = pe_ema_m
+    args._petrpe_head_w = pe_head_w
+    if pe_enable and (not hasattr(args, '_teacher_petrpe_head_online') or not hasattr(args, '_teacher_petrpe_head_ema')):
+        try:
+            args._teacher_petrpe_head_online = TeacherPETRPEHead(embed_dim=pe_embed_dim, use_fpe=pe_use_fpe,
+                                                                 lambda_pe=pe_lambda, pc_range=pe_pc_range,
+                                                                 debug=pe_debug).cuda()
+            args._teacher_petrpe_head_ema = TeacherPETRPEHead(embed_dim=pe_embed_dim, use_fpe=pe_use_fpe,
+                                                              lambda_pe=pe_lambda, pc_range=pe_pc_range,
+                                                              debug=False).cuda()
+            # EMA params不参与梯度
+            for p in args._teacher_petrpe_head_ema.parameters():
+                p.requires_grad = False
+            # 初始化 ema = online
+            args._teacher_petrpe_head_ema.load_state_dict(args._teacher_petrpe_head_online.state_dict())
+        except Exception:
+            args._teacher_petrpe_head_online = None
+            args._teacher_petrpe_head_ema = None
     if hasattr(args, 'optimizer') and args.optimizer.type == 'AdamW':
         # Build param groups without duplication: default group = all params minus special groups
         special_groups = []
@@ -176,6 +227,9 @@ def main_worker(gpu, ngpus_per_node, argss):
                 special_groups.append(group_config)
 
         default_params = [p for p in model.parameters() if p.requires_grad and p not in assigned_params]
+        # Append ONLY online TeacherPETRPEHead params if present/enabled
+        if pe_enable and hasattr(args, '_teacher_petrpe_head_online') and args._teacher_petrpe_head_online is not None:
+            default_params.extend([p for p in args._teacher_petrpe_head_online.parameters() if p.requires_grad])
         param_groups = [{'params': default_params}] + special_groups
         optimizer = torch.optim.AdamW(param_groups, lr=args.optimizer.lr, weight_decay=args.optimizer.weight_decay)
     else:
@@ -186,7 +240,7 @@ def main_worker(gpu, ngpus_per_node, argss):
     args.index_split = 0
 
     if args.distributed:
-        torch.cuda.set_device(gpu)
+        # torch.cuda.set_device(gpu) already called above
         args.batch_size = int(args.batch_size / ngpus_per_node)
         args.batch_size_val = int(args.batch_size_val / ngpus_per_node)
         args.workers = int(args.workers / ngpus_per_node)
@@ -527,6 +581,34 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
 
     text_features, palette = obtain_text_features_and_palette()
 
+    # --- Log PETR-PE/FPE status once ---
+    if main_process():
+        try:
+            petr_cfg = getattr(args, 'TEACHER_PETRPE', None)
+            if petr_cfg is not None:
+                enable = getattr(petr_cfg, 'enable', False)
+                use_fpe = getattr(petr_cfg, 'use_fpe', True)
+                lambda_pe = getattr(petr_cfg, 'lambda_pe', 1.0)
+                has_pc = hasattr(petr_cfg, 'pc_range')
+                pc_desc = 'fixed pc_range' if has_pc else 'per-scene min-max'
+                debug = getattr(petr_cfg, 'debug', False)
+                logger.info(f"[PETR-PE] enable={enable} use_fpe={use_fpe} lambda_pe={lambda_pe} norm={pc_desc} debug={debug}")
+            else:
+                # Fallback: some configs get flattened; try top-level keys
+                has_flat = any(hasattr(args, k) for k in ('enable', 'use_fpe', 'lambda_pe', 'debug'))
+                if has_flat:
+                    enable = getattr(args, 'enable', False)
+                    use_fpe = getattr(args, 'use_fpe', True)
+                    lambda_pe = getattr(args, 'lambda_pe', 1.0)
+                    has_pc = hasattr(args, 'pc_range')
+                    pc_desc = 'fixed pc_range' if has_pc else 'per-scene min-max'
+                    debug = getattr(args, 'debug', False)
+                    logger.info(f"[PETR-PE] (fallback) enable={enable} use_fpe={use_fpe} lambda_pe={lambda_pe} norm={pc_desc} debug={debug}")
+                else:
+                    logger.info('[PETR-PE] disabled (no TEACHER_PETRPE in cfg)')
+        except Exception:
+            pass
+
     # start the distillation process
     for i, batch_data in enumerate(train_loader):
         data_time.update(time.time() - end)
@@ -542,6 +624,65 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
             feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
         feat_3d, mask = feat_3d.cuda(non_blocking=True), mask.cuda(non_blocking=True)
 
+        # --- Teacher PETR-PE/FPE injection (config-gated) ---
+        # Support both nested (args.TEACHER_PETRPE) and flattened configs
+        petr_cfg = getattr(args, 'TEACHER_PETRPE', None)
+        if petr_cfg is not None:
+            enable = getattr(petr_cfg, 'enable', False)
+            lambda_pe = getattr(petr_cfg, 'lambda_pe', 1.0)
+            use_fpe = getattr(petr_cfg, 'use_fpe', True)
+            pc_range = getattr(petr_cfg, 'pc_range', None)
+            debug = getattr(petr_cfg, 'debug', False)
+        else:
+            enable = getattr(args, 'enable', False)
+            lambda_pe = getattr(args, 'lambda_pe', 1.0)
+            use_fpe = getattr(args, 'use_fpe', True)
+            pc_range = getattr(args, 'pc_range', None)
+            debug = getattr(args, 'debug', False)
+
+        if enable:
+            embed_dim = feat_3d.shape[1]
+            # create modules once
+            if not hasattr(args, '_teacher_petrpe_head_online') or not hasattr(args, '_teacher_petrpe_head_ema'):
+                args._teacher_petrpe_head_online = TeacherPETRPEHead(embed_dim=embed_dim, use_fpe=use_fpe, lambda_pe=lambda_pe,
+                                                                     pc_range=pc_range, debug=debug).cuda()
+                args._teacher_petrpe_head_ema = TeacherPETRPEHead(embed_dim=embed_dim, use_fpe=use_fpe, lambda_pe=lambda_pe,
+                                                                  pc_range=pc_range, debug=False).cuda()
+                for p in args._teacher_petrpe_head_ema.parameters():
+                    p.requires_grad = False
+                args._teacher_petrpe_head_ema.load_state_dict(args._teacher_petrpe_head_online.state_dict())
+                # add only online params to optimizer if missing
+                try:
+                    optimizer.add_param_group({'params': [p for p in args._teacher_petrpe_head_online.parameters() if p.requires_grad]})
+                except Exception:
+                    pass
+            # forward (align coords with fused features length using mask when needed)
+            coords_pe = coords.cuda(non_blocking=True)
+            if coords_pe.size(0) != feat_3d.size(0):
+                try:
+                    coords_pe = coords_pe[mask]
+                except Exception:
+                    pass
+            # online / ema outputs
+            t_online = args._teacher_petrpe_head_online(coords_pe, args.voxel_size, feat_3d)
+            with torch.no_grad():
+                t_ema = args._teacher_petrpe_head_ema(coords_pe, args.voxel_size, feat_3d)
+            # debug
+            if debug and main_process() and getattr(args._teacher_petrpe_head_online, '_last_debug', None) is not None:
+                dbg = args._teacher_petrpe_head_online._last_debug
+                try:
+                    logger.info('[PETR-PE-debug] pos_min={} pos_max={} ratio_mean={:.4f} p10={:.4f} p90={:.4f} gate_mean={} gate_p10={} gate_p90={}'
+                                .format(tuple(dbg['pos_min'].tolist()), tuple(dbg['pos_max'].tolist()),
+                                        dbg['ratio_mean'], dbg['ratio_p10'], dbg['ratio_p90'],
+                                        (None if dbg['gate_mean'] is None else f"{dbg['gate_mean']:.4f}"),
+                                        (None if dbg['gate_p10'] is None else f"{dbg['gate_p10']:.4f}"),
+                                        (None if dbg['gate_p90'] is None else f"{dbg['gate_p90']:.4f}")))
+                except Exception:
+                    pass
+        else:
+            t_online = feat_3d
+            t_ema = feat_3d
+
         output_3d = model(sinput)
         # Sanitize network outputs to prevent propagation of non-finite values
         output_3d = torch.nan_to_num(output_3d, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -552,25 +693,51 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
             with torch.no_grad():
                 valid_rows = (
                     torch.isfinite(output_3d).all(dim=1)
-                    & torch.isfinite(feat_3d).all(dim=1)
-                    & (feat_3d.abs().sum(dim=1) > 0)
+                    & torch.isfinite(t_ema).all(dim=1)
+                    & (t_ema.abs().sum(dim=1) > 0)
                 )
             if valid_rows.any():
                 cosv = nn.functional.cosine_similarity(
-                    output_3d[valid_rows], feat_3d[valid_rows], dim=1, eps=1e-6
+                    output_3d[valid_rows], t_ema[valid_rows].detach(), dim=1, eps=1e-6
                 )
                 loss = (1 - cosv).mean()
             else:
                 loss = torch.zeros((), device=output_3d.device, dtype=output_3d.dtype)
         elif hasattr(args, 'loss_type') and args.loss_type == 'l1':
-            loss = torch.nn.L1Loss()(output_3d, feat_3d)
+            loss = torch.nn.L1Loss()(output_3d, t_ema.detach())
         else:
             raise NotImplementedError
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        # Optional: online teacher head small loss to keep semantics (no student signal)
+        if enable and args._petrpe_head_w > 0:
+            with torch.no_grad():
+                f_det = feat_3d.detach()
+            # cosine: 1 - cos(t_online, f_det)
+            sem_cos = nn.functional.cosine_similarity(t_online, f_det, dim=1, eps=1e-6)
+            loss_sem = (1 - sem_cos).mean()
+            # geometric residual alignment (use full PE, not orthogonalized)
+            # get last pe projection from online head (already with grad)
+            p = getattr(args._teacher_petrpe_head_online, '_last_pe', None)
+            if p is None:
+                p = torch.zeros_like(t_online)
+            # residual towards geometry (encourage residual to align with full p)
+            res = t_online - f_det
+            geo_cos = nn.functional.cosine_similarity(res, p, dim=1, eps=1e-6)
+            loss_geo = (1 - geo_cos).mean()
+            # combine
+            loss_head = float(args._petrpe_head_w) * (loss_sem + 0.5 * loss_geo)
+            loss_head.backward()
         optimizer.step()
+
+        # EMA update after optimizer.step()
+        if enable and hasattr(args, '_teacher_petrpe_head_ema') and args._teacher_petrpe_head_ema is not None:
+            with torch.no_grad():
+                m = float(args._petrpe_ema_m)
+                for p_ema, p_o in zip(args._teacher_petrpe_head_ema.parameters(), args._teacher_petrpe_head_online.parameters()):
+                    p_ema.data.mul_(m).add_(p_o.data, alpha=1.0 - m)
 
         loss_meter.update(loss.item(), args.batch_size)
         batch_time.update(time.time() - end)
@@ -616,9 +783,10 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
     coords_device = coords.to(mask.device, non_blocking=True) if isinstance(mask, torch.Tensor) else coords
     mask_first = (coords_device[mask][:, 0] == 0)
     output_3d = output_3d[mask_first]
-    feat_3d = feat_3d[mask_first]
+    # use t_ema (teacher with 3D PE/FPE) for visualization, detach to CPU
+    t_ema_vis = t_ema[mask_first] if isinstance(t_ema, torch.Tensor) else feat_3d[mask_first]
     logits_pred = output_3d.half() @ text_features.t()
-    logits_img = feat_3d.half() @ text_features.t()
+    logits_img = t_ema_vis.half() @ text_features.t()
     logits_pred = torch.max(logits_pred, 1)[1].cpu().numpy()
     logits_img = torch.max(logits_img, 1)[1].cpu().numpy()
     mask = mask.cpu().numpy()

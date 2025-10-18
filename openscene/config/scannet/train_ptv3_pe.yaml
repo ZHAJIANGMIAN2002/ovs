@@ -1,8 +1,8 @@
 
 DATA:
   data_root: data/scannet_3d
-  data_root_2d_fused_feature: data/scannet_multiview_openseg
-  feature_2d_extractor: openseg
+  data_root_2d_fused_feature: data/scannet_multiview_lseg
+  feature_2d_extractor: lseg
   classes: 20
   aug: True
   voxel_size: 0.02
@@ -15,14 +15,14 @@ DISTILL:
   in_channels: 3
   pretrained_3d: /root/model_best.pth
   ignore_label: 255
-  train_gpu: [2,3,7]  
+  train_gpu: [0,1,2,3,6,7]  
   workers: 8  
   batch_size: 64  
   batch_size_val: 8  
   sync_bn: True
   multiprocessing_distributed: True
   dist_url: tcp://127.0.0.1:6789
-  base_lr: 0.0001  # fallback only, overridden by optimizer.lr below
+  base_lr: 0.0001
   loss_type: cosine
   loop: 5
   epochs: 200
@@ -44,27 +44,24 @@ DISTILL:
     hidden_dim: 256     # only used when type=mlp
     dropout: 0.1        # only used when type=mlp
     use_ln: True        # LayerNorm before MLP when type=mlp
-    pre_expand_dim: 128 # optional: pre-expand 64->128 before MLP; remove to disable
-    pre_expand_act: True
 
-  # Optimizer and scheduler aligned with PTV3, scaled for batch_size=64x3=192
-  # sqrt scaling: 0.006 * sqrt(192/12) = 0.024 (conservative)
+  # Add optimizer and scheduler settings from PTV3's original config
   optimizer:
     type: "AdamW"
-    lr: 0.024  # scaled from 0.006 for global batch=192 vs original=12
+    lr: 0.006
     weight_decay: 0.05
   
   scheduler:
     type: "OneCycleLR"
-    max_lr: [0.024, 0.0024]  # scaled proportionally (default group, block group)
-    pct_start: 0.10  # 20 epoch warmup for smoother ramp-up (vs 0.05 for 800 epochs)
+    max_lr: [0.006, 0.0006]
+    pct_start: 0.05
     anneal_strategy: "cos"
     div_factor: 10.0
     final_div_factor: 1000.0
 
   param_dicts:
     - keyword: "block"
-      lr: 0.0024  # scaled from 0.0006 (1/10 of main lr)
+      lr: 0.0006
 
 TEST:
   split: val
@@ -72,19 +69,26 @@ TEST:
   mark_no_feature_to_unknown: True
   feature_type: 'distill' # We are evaluating the distilled model
   save_feature_as_numpy: False
-  vis_input: True
-  vis_pred: True
-  vis_gt: True
+  vis_input: False
+  vis_pred: False
+  vis_gt: False
   test_workers: 8
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_pretrained/model/model_best.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg_pe/model/model_best_rank1.pth.tar'
   save_folder:
 
 Distributed:
-  dist_url: tcp://127.0.0.1:6789
+  dist_url: tcp://127.0.0.1:6788 
   dist_backend: 'nccl'
   multiprocessing_distributed: True 
   world_size: 1  
   rank: 0   
+
+# Teacher PETR-PE/FPE injection (gated)
+TEACHER_PETRPE:
+  enable: True
+  use_fpe: true
+  lambda_pe: 1.0
+  debug: False
