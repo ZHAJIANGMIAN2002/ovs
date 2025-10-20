@@ -563,6 +563,11 @@ def obtain_text_features_and_palette():
 
     # Use the same text feature pipeline as inference (supports prompt_eng)
     text_features = extract_text_feature(labelset, args)
+    # Normalize text prototypes once to use cosine similarity at inference
+    try:
+        text_features = torch.nn.functional.normalize(text_features.float(), dim=1)
+    except Exception:
+        pass
     return text_features, palette
 
 

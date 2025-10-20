@@ -151,8 +151,6 @@ class TeacherPETRPEHead(nn.Module):
         # 2) PETR 3D PE (sine/cos) -> 1.5C -> 2-layer proj -> C
         pe_raw = self.pos2posemb3d(pos, num_pos_feats=self.num_pos_feats)
         pe_proj = self.pe_fc2(self.pe_act(self.pe_fc1(pe_raw)))
-        # expose for optional geometric loss outside (keep grad)
-        self._last_pe = pe_proj
 
         # 3) residual add
         h = feat_3d + (self.lambda_pe * pe_proj)
