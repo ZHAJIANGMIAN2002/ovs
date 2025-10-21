@@ -512,44 +512,77 @@ def obtain_text_features_and_palette():
     return text_features, palette
 
 
-def info_nce_loss(student_feat, teacher_feat, temperature=0.07, eps=1e-6):
+def info_nce_loss(student_feat, teacher_feat, coords_3d=None, temperature=0.07, eps=1e-6, K_macro=48, K_micro=16):
     """
-    InfoNCE contrastive loss for distillation.
+    InfoNCE contrastive loss with hybrid hard negative mining (macro + micro).
     
     Args:
         student_feat: (N, C) 3D student features
-        teacher_feat: (N, C) 2D teacher pseudo-labels
+        teacher_feat: (N, C) 2D teacher features (paired supervision)
+        coords_3d: (N, 3) 3D coordinates for spatial neighborhood (optional)
         temperature: float, temperature for softmax
         eps: float, numerical stability
+        K_macro: int, number of global hard negatives (most dissimilar in entire batch)
+        K_micro: int, number of local hard negatives (most dissimilar in spatial neighborhood)
     
     Returns:
         loss: scalar tensor
     """
-    # Ensure same dtype (cast to float32 for numerical stability)
-    student_feat = student_feat.float()
-    teacher_feat = teacher_feat.float()
-    # Normalize features to use cosine similarity
-    student_norm = nn.functional.normalize(student_feat, dim=1, eps=eps)
-    teacher_norm = nn.functional.normalize(teacher_feat, dim=1, eps=eps)
+    N = student_feat.size(0)
+    K_neg = K_macro + K_micro
+    student_norm = nn.functional.normalize(student_feat.float(), dim=1, eps=eps)
+    teacher_norm = nn.functional.normalize(teacher_feat.float(), dim=1, eps=eps)
     
-    # Compute similarity matrix: (N, N)
-    # sim[i,j] = cos(student[i], teacher[j])
+    # Compute similarity matrix: (N, N), sim[i,j] = cos(student[i], teacher[j]) / τ
     sim_matrix = torch.matmul(student_norm, teacher_norm.t()) / temperature
     
-    # Positive samples are on the diagonal: sim[i,i]
-    # Negatives are off-diagonal: sim[i,j] where j≠i
+    # Positive samples: diagonal (supervised pair: student[i] ↔ teacher[i])
+    pos_sim = torch.diagonal(sim_matrix)  # (N,)
     
-    # For numerical stability, subtract max before exp
-    sim_matrix_exp = torch.exp(sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach())
+    # Hard negative mining: macro (global) + micro (local spatial neighborhood)
+    if N > K_neg + 1 and coords_3d is not None:
+        # Mask out diagonal when selecting negatives
+        neg_mask = ~torch.eye(N, dtype=torch.bool, device=sim_matrix.device)
+        sim_for_neg = sim_matrix.masked_fill(~neg_mask, float('inf'))
+        
+        # Macro negatives: K_macro globally most dissimilar points
+        macro_neg_sims, _ = torch.topk(sim_for_neg, K_macro, dim=1, largest=False)
+        
+        # Micro negatives: K_micro most dissimilar within spatial neighborhood
+        # Compute spatial distance to find K_neighbor nearest points
+        K_neighbor = max(K_micro * 4, 128)  # Sample from local neighborhood (4x micro for diversity)
+        coords_norm = coords_3d.float()
+        spatial_dist = torch.cdist(coords_norm, coords_norm)  # (N, N)
+        spatial_dist.fill_diagonal_(float('inf'))  # Exclude self
+        _, neighbor_indices = torch.topk(spatial_dist, K_neighbor, dim=1, largest=False)  # (N, K_neighbor)
+        
+        # Gather similarities within neighborhood
+        neighbor_sims = torch.gather(sim_matrix, 1, neighbor_indices)  # (N, K_neighbor)
+        # Select K_micro hardest (most dissimilar) from neighborhood
+        micro_neg_sims, local_indices = torch.topk(neighbor_sims, K_micro, dim=1, largest=False)
+        
+        # Combine macro + micro hard negatives
+        hard_neg_sims = torch.cat([macro_neg_sims, micro_neg_sims], dim=1)  # (N, K_macro+K_micro)
+        
+        # Compute InfoNCE: -log(exp(pos) / (exp(pos) + sum(exp(hard_negs))))
+        numerator = torch.exp(pos_sim - pos_sim.detach().max())
+        denominator = numerator + torch.exp(hard_neg_sims - pos_sim.unsqueeze(1).detach().max()).sum(dim=1)
+        loss = -torch.log(numerator / (denominator + eps)).mean() / math.log(max(N, 2))
+    elif N > K_neg + 1:
+        # Fallback: macro-only hard mining (when coords unavailable)
+        neg_mask = ~torch.eye(N, dtype=torch.bool, device=sim_matrix.device)
+        sim_for_neg = sim_matrix.masked_fill(~neg_mask, float('inf'))
+        hard_neg_sims, _ = torch.topk(sim_for_neg, K_neg, dim=1, largest=False)
+        
+        numerator = torch.exp(pos_sim - pos_sim.detach().max())
+        denominator = numerator + torch.exp(hard_neg_sims - pos_sim.unsqueeze(1).detach().max()).sum(dim=1)
+        loss = -torch.log(numerator / (denominator + eps)).mean() / math.log(max(N, 2))
+    else:
+        # Small batch fallback: use all negatives
+        sim_matrix_exp = torch.exp(sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach())
+        denom = sim_matrix_exp.sum(dim=1, keepdim=True)
+        loss = -torch.log(sim_matrix_exp.diagonal() / (denom.squeeze(1) + eps)).mean() / math.log(max(N, 2))
     
-    # Denominator: sum over all j (positive + negatives)
-    denom = sim_matrix_exp.sum(dim=1, keepdim=True)
-    
-    # Numerator: only diagonal (positive pairs)
-    pos_sim = torch.diagonal(sim_matrix_exp)
-    
-    # InfoNCE: -log(exp(pos) / sum(exp(all))), normalized by log(N) to match cosine loss scale
-    loss = -torch.log(pos_sim / (denom.squeeze(1) + eps)).mean() / math.log(max(student_feat.size(0), 2))
     return loss
 
 
@@ -601,14 +634,22 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
                 output_valid = output_3d[valid_rows]
                 feat_valid = feat_3d[valid_rows]
                 
+                # Extract 3D coordinates for valid points (for micro-negative spatial sampling)
+                coords_valid = coords[mask][valid_rows][:, 1:4].float()  # (N_valid, 3), strip batch index
+                
                 # L_point: original pointwise alignment
                 cosv = nn.functional.cosine_similarity(
                     output_valid, feat_valid, dim=1, eps=1e-6
                 )
                 loss_point = (1 - cosv).mean()
                 
-                # L_contrast: InfoNCE for structural learning
-                loss_contrast = info_nce_loss(output_valid, feat_valid, temperature=0.07)
+                # L_contrast: InfoNCE with macro (48) + micro (16) hard negatives
+                loss_contrast = info_nce_loss(output_valid, feat_valid, coords_3d=coords_valid, 
+                                             temperature=0.07, K_macro=48, K_micro=16)
+                
+                # Debug: print N once per epoch to verify point count
+                if i == 0 and main_process():
+                    logger.info(f'[InfoNCE] Epoch {epoch+1}: N_valid={output_valid.size(0)}, K_macro=48, K_micro=16')
                 
                 # Hybrid: α=0.5 (balance stability and robustness)
                 alpha = 0.5
