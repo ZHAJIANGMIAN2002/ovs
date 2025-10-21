@@ -318,7 +318,8 @@ def evaluate(model, val_data_loader, labelset_name='scannet_3d'):
                     feat_ensemble = predictions.clone().half()
                     mask_ =  pred_distill.max(dim=-1)[0] < pred_fusion.max(dim=-1)[0]
                     feat_ensemble[mask_] = feat_fuse[mask_]
-                    pred = feat_ensemble @ text_features.t()
+                    # Normalize ensemble features before computing logits (critical for InfoNCE!)
+                    pred = (feat_ensemble / (feat_ensemble.norm(dim=-1, keepdim=True) + 1e-5)) @ text_features.t()
                     logits_pred = torch.max(pred, 1)[1].detach().cpu()
 
                     predictions = feat_ensemble # if we need to save the features

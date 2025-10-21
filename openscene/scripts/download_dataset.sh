@@ -1,4 +1,5 @@
 echo "This script downloads pre-processed datasets used in the OpenScene project."
+echo "This script supports resume downloading. If download is interrupted, just run the script again."
 echo "Choose from the following options:"
 echo "0 - ScanNet 3D (point clouds with GT semantic labels)"
 echo "1 - ScanNet 2D (RGB-D images with camera poses)"
@@ -21,7 +22,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/scannet_processed/scannet_3d.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/scannet_processed/scannet_3d.zip
     echo "Done! Start unzipping ..."
     unzip scannet_3d.zip
     echo "Done!"
@@ -31,7 +32,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/scannet_processed/scannet_2d.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/scannet_processed/scannet_2d.zip
     echo "Done! Start unzipping ..."
     unzip scannet_2d.zip
     echo "Done!"
@@ -41,7 +42,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_3d.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_3d.zip
     echo "Done! Start unzipping ..."
     unzip matterport_3d.zip
     echo "Done!"
@@ -51,7 +52,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_2d.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_2d.zip
     echo "Done! Start unzipping ..."
     unzip matterport_2d.zip
     echo "Done!"
@@ -61,7 +62,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/nuscenes_processed/nuscenes_3d.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/nuscenes_processed/nuscenes_3d.zip
     echo "Done! Start unzipping ..."
     unzip nuscenes_3d.zip
     echo "Done!"
@@ -71,7 +72,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/nuscenes_processed/nuscenes_3d_train.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/nuscenes_processed/nuscenes_3d_train.zip
     echo "Done! Start unzipping ..."
     unzip nuscenes_3d_train.zip
     mv -r train nuscenes_3d_train
@@ -82,7 +83,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/nuscenes_processed/nuscenes_2d.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/nuscenes_processed/nuscenes_2d.zip
     echo "Done! Start unzipping ..."
     unzip nuscenes_2d.zip
     echo "Done!"
@@ -92,7 +93,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/replica_processed/replica_3d.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/replica_processed/replica_3d.zip
     echo "Done! Start unzipping ..."
     unzip replica_3d.zip
     echo "Done!"
@@ -102,7 +103,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/replica_processed/replica_2d.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/replica_processed/replica_2d.zip
     echo "Done! Start unzipping ..."
     unzip replica_2d.zip
     echo "Done!"
@@ -112,7 +113,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_3d_40.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_3d_40.zip
     echo "Done! Start unzipping ..."
     unzip matterport_3d_40.zip
     echo "Done!"
@@ -122,7 +123,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_3d_80.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_3d_80.zip
     echo "Done! Start unzipping ..."
     unzip matterport_3d_80.zip
     echo "Done!"
@@ -132,7 +133,7 @@ then
     mkdir -p data
     cd data
     echo "Start downloading ..."
-    wget https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_3d_160.zip
+    wget -c https://cvg-data.inf.ethz.ch/openscene/data/matterport_processed/matterport_3d_160.zip
     echo "Done! Start unzipping ..."
     unzip matterport_3d_160.zip
     echo "Done!"

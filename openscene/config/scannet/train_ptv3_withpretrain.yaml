@@ -34,7 +34,7 @@ DISTILL:
   print_freq: 10
   save_freq: 1
   save_path: out/scannet_ptv3_test 
-  resume: /root/zjm/ovs/openscene/out/scannet_ptv3_lseg2/model/model_best_rank2.pth.tar
+  resume: /root/zjm/ovs/openscene/out/scannet_ptv3_lseg2/model/model_best_rank1.pth.tar
   evaluate: True
   eval_freq: 1
 

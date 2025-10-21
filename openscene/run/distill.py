@@ -4,7 +4,7 @@ import random
 import numpy as np
 import logging
 import argparse
-
+import math
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -512,6 +512,47 @@ def obtain_text_features_and_palette():
     return text_features, palette
 
 
+def info_nce_loss(student_feat, teacher_feat, temperature=0.07, eps=1e-6):
+    """
+    InfoNCE contrastive loss for distillation.
+    
+    Args:
+        student_feat: (N, C) 3D student features
+        teacher_feat: (N, C) 2D teacher pseudo-labels
+        temperature: float, temperature for softmax
+        eps: float, numerical stability
+    
+    Returns:
+        loss: scalar tensor
+    """
+    # Ensure same dtype (cast to float32 for numerical stability)
+    student_feat = student_feat.float()
+    teacher_feat = teacher_feat.float()
+    # Normalize features to use cosine similarity
+    student_norm = nn.functional.normalize(student_feat, dim=1, eps=eps)
+    teacher_norm = nn.functional.normalize(teacher_feat, dim=1, eps=eps)
+    
+    # Compute similarity matrix: (N, N)
+    # sim[i,j] = cos(student[i], teacher[j])
+    sim_matrix = torch.matmul(student_norm, teacher_norm.t()) / temperature
+    
+    # Positive samples are on the diagonal: sim[i,i]
+    # Negatives are off-diagonal: sim[i,j] where j≠i
+    
+    # For numerical stability, subtract max before exp
+    sim_matrix_exp = torch.exp(sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach())
+    
+    # Denominator: sum over all j (positive + negatives)
+    denom = sim_matrix_exp.sum(dim=1, keepdim=True)
+    
+    # Numerator: only diagonal (positive pairs)
+    pos_sim = torch.diagonal(sim_matrix_exp)
+    
+    # InfoNCE: -log(exp(pos) / sum(exp(all))), normalized by log(N) to match cosine loss scale
+    loss = -torch.log(pos_sim / (denom.squeeze(1) + eps)).mean() / math.log(max(student_feat.size(0), 2))
+    return loss
+
+
 def distill(train_loader, model, optimizer, scheduler, epoch):
     '''Distillation pipeline.'''
 
@@ -556,14 +597,30 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
                     & (feat_3d.abs().sum(dim=1) > 0)
                 )
             if valid_rows.any():
+                # Hybrid loss: pointwise cosine + InfoNCE contrastive
+                output_valid = output_3d[valid_rows]
+                feat_valid = feat_3d[valid_rows]
+                
+                # L_point: original pointwise alignment
                 cosv = nn.functional.cosine_similarity(
-                    output_3d[valid_rows], feat_3d[valid_rows], dim=1, eps=1e-6
+                    output_valid, feat_valid, dim=1, eps=1e-6
                 )
-                loss = (1 - cosv).mean()
+                loss_point = (1 - cosv).mean()
+                
+                # L_contrast: InfoNCE for structural learning
+                loss_contrast = info_nce_loss(output_valid, feat_valid, temperature=0.07)
+                
+                # Hybrid: α=0.5 (balance stability and robustness)
+                alpha = 0.5
+                loss = alpha * loss_point + (1 - alpha) * loss_contrast
             else:
                 loss = torch.zeros((), device=output_3d.device, dtype=output_3d.dtype)
+                loss_point = loss.clone()
+                loss_contrast = loss.clone()
         elif hasattr(args, 'loss_type') and args.loss_type == 'l1':
             loss = torch.nn.L1Loss()(output_3d, feat_3d)
+            loss_point = loss.clone()
+            loss_contrast = torch.zeros_like(loss)
         else:
             raise NotImplementedError
 
@@ -609,6 +666,10 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
         if main_process():
             # writer.add_scalar('loss_train_batch', loss_meter.val, current_iter)
             writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], current_iter)
+            # Log hybrid loss components
+            if hasattr(args, 'loss_type') and args.loss_type == 'cosine':
+                writer.add_scalar('loss/loss_point', loss_point.item(), current_iter)
+                writer.add_scalar('loss/loss_contrast', loss_contrast.item(), current_iter)
 
         end = time.time()
 
