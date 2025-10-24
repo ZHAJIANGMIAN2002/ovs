@@ -459,6 +459,8 @@ def get_model(cfg):
                     for cand in candidate_keys(k):
                         if cand in msd and msd[cand].shape != getattr(v, 'shape', None):
                             # Special-case: first conv 6->3 channel slice (spconv weight [out,kx,ky,kz,in])
+                            # BUT: Skip this if VS3D-PE is enabled (will be handled by expand_pretrained_weights_for_pe)
+                            use_pe = hasattr(model, 'use_vs3d_pe') and model.use_vs3d_pe
                             if (
                                 isinstance(v, torch.Tensor)
                                 and isinstance(msd[cand], torch.Tensor)
@@ -466,6 +468,7 @@ def get_model(cfg):
                                 and v.shape[:-1] == msd[cand].shape[:-1]
                                 and v.shape[-1] > msd[cand].shape[-1]
                                 and ('stem.conv.weight' in k or 'stem.conv.weight' in cand)
+                                and not use_pe  # Skip slicing if PE is enabled
                             ):
                                 msd[cand].copy_(v[..., : msd[cand].shape[-1]])
                                 loaded += 1
@@ -483,6 +486,11 @@ def get_model(cfg):
                     if not matched:
                         skipped += 1
 
+            # CRITICAL: If VS3D-PE is enabled, expand first layer weights to accommodate PE channels
+            if hasattr(model, 'expand_pretrained_weights_for_pe'):
+                print("\nExpanding pretrained weights for VS3D-PE...")
+                msd = model.expand_pretrained_weights_for_pe(msd)
+            
             model.load_state_dict(msd)
             total = len(state)
             print(f"[pretrained_3d] Loaded from {ckpt_path}: matched={loaded}, mismatched={mismatched}, skipped={skipped}, total_keys={total}")
@@ -572,18 +580,36 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
     for i, batch_data in enumerate(train_loader):
         data_time.update(time.time() - end)
 
-        (coords, feat, label_3d, feat_3d, mask) = batch_data
+        # Handle variable-length batch_data (with or without PE data)
+        if len(batch_data) == 7:  # With PE metadata
+            (coords, feat, label_3d, feat_3d, mask, coords_world, pe_metadata) = batch_data
+        else:  # Without PE metadata (backward compatible)
+            (coords, feat, label_3d, feat_3d, mask) = batch_data
+            coords_world, pe_metadata = None, None
 
         # Light random translation while keeping integer coordinates
         # coords[:, 1:4] += (torch.rand(3) * 100).type_as(coords)
 
         # Move to GPU before building SparseTensor and sanitize fused 3D features
         feat_3d = torch.nan_to_num(feat_3d, nan=0.0, posinf=1e4, neginf=-1e4)
-        sinput = SparseTensor(
-            feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
+        coords_gpu = coords.cuda(non_blocking=True)
+        feat_gpu = feat.cuda(non_blocking=True)
+        
+        # Create RGB SparseTensor
+        sinput = SparseTensor(feat_gpu, coords_gpu)
         feat_3d, mask = feat_3d.cuda(non_blocking=True), mask.cuda(non_blocking=True)
+        
+        # Prepare PE data AFTER mask is ready
+        if coords_world is not None:
+            pe_data = (
+                coords_world.cuda(non_blocking=True), 
+                pe_metadata,
+                mask  # Pass mask so model knows which points have PE data
+            )
+        else:
+            pe_data = None
 
-        output_3d = model(sinput)
+        output_3d = model(sinput, pe_data=pe_data)
         # Sanitize network outputs to prevent propagation of non-finite values
         output_3d = torch.nan_to_num(output_3d, nan=0.0, posinf=1e4, neginf=-1e4)
         output_3d = output_3d[mask]
