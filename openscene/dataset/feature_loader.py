@@ -100,9 +100,14 @@ class FusedFeatureLoader(Point3DLoader):
             processed_data = torch.load(join(self.datapath_feat, scene_name+'.pt'))
 
         flag_mask_merge = False
+        
+        # Check if PE metadata is available
+        has_pe_metadata = 'coords_world' in processed_data and 'pe_metadata' in processed_data
+        
         if len(processed_data.keys())==2:
             flag_mask_merge = True
             feat_3d, mask_chunk = processed_data['feat'], processed_data['mask_full']
+            coords_world_3d, pe_metadata_3d = None, None  # No PE data
             if isinstance(mask_chunk, np.ndarray): # if the mask itself is a numpy array
                 mask_chunk = torch.from_numpy(mask_chunk)
             mask = copy.deepcopy(mask_chunk)
@@ -111,8 +116,37 @@ class FusedFeatureLoader(Point3DLoader):
                 feat_3d_new[mask] = feat_3d
                 feat_3d = feat_3d_new
                 mask_chunk = torch.ones_like(mask_chunk) # every point needs to be evaluted
+        elif has_pe_metadata:  # New format with PE metadata (4 keys)
+            flag_mask_merge = True
+            feat_3d = processed_data['feat']
+            mask_chunk = processed_data['mask_full']
+            coords_world_3d = processed_data['coords_world']  # [N_masked, 3]
+            pe_metadata_3d = processed_data['pe_metadata']    # List[N_masked] of dicts
+            if isinstance(mask_chunk, np.ndarray):
+                mask_chunk = torch.from_numpy(mask_chunk)
+            mask = copy.deepcopy(mask_chunk)
+            if self.split != 'train': # val or test set
+                feat_3d_new = torch.zeros((locs_in.shape[0], feat_3d.shape[1]), dtype=feat_3d.dtype)
+                feat_3d_new[mask] = feat_3d
+                feat_3d = feat_3d_new
+                
+                # Expand PE data to match full point cloud size
+                coords_world_new = torch.zeros((locs_in.shape[0], 3), dtype=coords_world_3d.dtype)
+                coords_world_new[mask] = coords_world_3d
+                coords_world_3d = coords_world_new
+                
+                # Expand pe_metadata with empty entries for non-visible points
+                pe_metadata_new = [{'visible_view_ids': [], 'camera_extrinsics': np.zeros((0, 4, 4), dtype=np.float32)} 
+                                   for _ in range(locs_in.shape[0])]
+                mask_indices = mask.nonzero(as_tuple=False).squeeze(1)
+                for i, idx in enumerate(mask_indices):
+                    pe_metadata_new[idx.item()] = pe_metadata_3d[i]
+                pe_metadata_3d = pe_metadata_new
+                
+                mask_chunk = torch.ones_like(mask_chunk)
         elif len(processed_data.keys())>2: # legacy, for old processed features
             feat_3d, mask_visible, mask_chunk = processed_data['feat'], processed_data['mask'], processed_data['mask_full']
+            coords_world_3d, pe_metadata_3d = None, None  # No PE data
             mask = torch.zeros(feat_3d.shape[0], dtype=torch.bool)
             mask[mask_visible] = True # mask out points without feature assigned
 
@@ -142,6 +176,11 @@ class FusedFeatureLoader(Point3DLoader):
 
             # get the corresponding features after voxelization
             feat_3d = feat_3d[indices]
+            
+            # Apply same indexing to PE data if available
+            if coords_world_3d is not None:
+                coords_world_3d = coords_world_3d[indices]
+                pe_metadata_3d = [pe_metadata_3d[i] for i in indices.tolist()]
         elif self.split == 'train' and not flag_mask_merge: # legacy, for old processed features
             feat_3d = feat_3d[mask] # get features for visible points
             locs, feats, labels, inds_reconstruct, vox_ind = self.voxelizer.voxelize(
@@ -164,12 +203,22 @@ class FusedFeatureLoader(Point3DLoader):
 
             # get the corresponding features after voxelization
             feat_3d = feat_3d[indices]
+            
+            # Apply same indexing to PE data if available
+            if coords_world_3d is not None:
+                coords_world_3d = coords_world_3d[indices]
+                pe_metadata_3d = [pe_metadata_3d[i] for i in indices.tolist()]
         else:
             locs, feats, labels, inds_reconstruct, vox_ind = self.voxelizer.voxelize(
                 locs[mask_chunk], feats_in[mask_chunk], labels_in[mask_chunk], return_ind=True)
             vox_ind = torch.from_numpy(vox_ind)
             feat_3d = feat_3d[vox_ind]
             mask = mask[vox_ind]
+            
+            # Apply same voxelization to PE data if available
+            if coords_world_3d is not None:
+                coords_world_3d = coords_world_3d[vox_ind]
+                pe_metadata_3d = [pe_metadata_3d[i] for i in vox_ind.tolist()]
 
         if self.eval_all: # during evaluation, no voxelization for GT labels
             labels = labels_in
@@ -186,7 +235,12 @@ class FusedFeatureLoader(Point3DLoader):
 
         if self.eval_all:
             return coords, feats, labels, feat_3d, mask, torch.from_numpy(inds_reconstruct).long()
-        return coords, feats, labels, feat_3d, mask
+        
+        # Return PE data if available
+        if coords_world_3d is not None:
+            return coords, feats, labels, feat_3d, mask, coords_world_3d, pe_metadata_3d
+        else:
+            return coords, feats, labels, feat_3d, mask
 
 def collation_fn(batch):
     '''
@@ -197,15 +251,34 @@ def collation_fn(batch):
                 colors: B x C x H x W x V
                 labels_2d:  B x H x W x V
                 links:  N x 4 x V (B,H,W,mask)
+                [optional] coords_world: N x 3
+                [optional] pe_metadata: List[N] of dicts
 
     '''
-    coords, feats, labels, feat_3d, mask_chunk = list(zip(*batch))
+    # Check if batch contains PE data (variable-length tuple)
+    has_pe_data = len(batch[0]) == 7
+    
+    if has_pe_data:
+        coords, feats, labels, feat_3d, mask_chunk, coords_world, pe_metadata = list(zip(*batch))
+    else:
+        coords, feats, labels, feat_3d, mask_chunk = list(zip(*batch))
 
     for i in range(len(coords)):
         coords[i][:, 0] *= i
 
-    return torch.cat(coords), torch.cat(feats), torch.cat(labels), \
-        torch.cat(feat_3d), torch.cat(mask_chunk)
+    if has_pe_data:
+        # Concatenate coords_world and flatten pe_metadata across batch
+        coords_world_cat = torch.cat(coords_world, dim=0)  # [N_total, 3]
+        pe_metadata_flat = []
+        for pe_meta_list in pe_metadata:
+            pe_metadata_flat.extend(pe_meta_list)  # Flatten list of lists
+        
+        return (torch.cat(coords), torch.cat(feats), torch.cat(labels),
+                torch.cat(feat_3d), torch.cat(mask_chunk),
+                coords_world_cat, pe_metadata_flat)
+    else:
+        return (torch.cat(coords), torch.cat(feats), torch.cat(labels),
+                torch.cat(feat_3d), torch.cat(mask_chunk))
 
 
 def collation_fn_eval_all(batch):
