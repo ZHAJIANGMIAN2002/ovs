@@ -22,7 +22,8 @@ from util.util import AverageMeter, intersectionAndUnionGPU, \
     export_pointcloud, get_palette, convert_labels_with_palette, extract_clip_feature, extract_text_feature
 from dataset.label_constants import *
 from dataset.feature_loader import FusedFeatureLoader, collation_fn
-from dataset.point_loader import Point3DLoader, collation_fn_eval_all
+from dataset.feature_loader import collation_fn_eval_all as collation_fn_eval_all_pe
+from dataset.point_loader import Point3DLoader, collation_fn_eval_all as collation_fn_eval_all_base
 from models.disnet import DisNet as Model
 from tqdm import tqdm
 
@@ -279,18 +280,31 @@ def main_worker(gpu, ngpus_per_node, argss):
                 pass
 
     if args.evaluate:
-        val_data = Point3DLoader(datapath_prefix=args.data_root,
-                                 voxel_size=args.voxel_size,
-                                 split='val', aug=False,
-                                 memcache_init=args.use_shm,
-                                 eval_all=True,
-                                 input_color=args.input_color)
+        # Validation/test will use 3DPE whenever use_vs3d_pe is True (aligned evaluation)
+        use_pe_infer = getattr(args, 'use_vs3d_pe', False)
+        if use_pe_infer:
+            val_data = FusedFeatureLoader(datapath_prefix=args.data_root,
+                                          datapath_prefix_feat=args.data_root_2d_fused_feature,
+                                          voxel_size=args.voxel_size,
+                                          split='val', aug=False,
+                                          memcache_init=args.use_shm,
+                                          eval_all=True,
+                                          input_color=args.input_color)
+            collate_eval = collation_fn_eval_all_pe
+        else:
+            val_data = Point3DLoader(datapath_prefix=args.data_root,
+                                     voxel_size=args.voxel_size,
+                                     split='val', aug=False,
+                                     memcache_init=args.use_shm,
+                                     eval_all=True,
+                                     input_color=args.input_color)
+            collate_eval = collation_fn_eval_all_base
         val_sampler = torch.utils.data.distributed.DistributedSampler(
             val_data) if args.distributed else None
         val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size_val,
                                                 shuffle=False,
                                                 num_workers=args.workers, pin_memory=True,
-                                                drop_last=False, collate_fn=collation_fn_eval_all,
+                                                drop_last=False, collate_fn=collate_eval,
                                                 sampler=val_sampler)
 
         criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label).cuda(gpu) # for evaluation
@@ -459,8 +473,6 @@ def get_model(cfg):
                     for cand in candidate_keys(k):
                         if cand in msd and msd[cand].shape != getattr(v, 'shape', None):
                             # Special-case: first conv 6->3 channel slice (spconv weight [out,kx,ky,kz,in])
-                            # BUT: Skip this if VS3D-PE is enabled (will be handled by expand_pretrained_weights_for_pe)
-                            use_pe = hasattr(model, 'use_vs3d_pe') and model.use_vs3d_pe
                             if (
                                 isinstance(v, torch.Tensor)
                                 and isinstance(msd[cand], torch.Tensor)
@@ -468,7 +480,6 @@ def get_model(cfg):
                                 and v.shape[:-1] == msd[cand].shape[:-1]
                                 and v.shape[-1] > msd[cand].shape[-1]
                                 and ('stem.conv.weight' in k or 'stem.conv.weight' in cand)
-                                and not use_pe  # Skip slicing if PE is enabled
                             ):
                                 msd[cand].copy_(v[..., : msd[cand].shape[-1]])
                                 loaded += 1
@@ -486,10 +497,7 @@ def get_model(cfg):
                     if not matched:
                         skipped += 1
 
-            # CRITICAL: If VS3D-PE is enabled, expand first layer weights to accommodate PE channels
-            if hasattr(model, 'expand_pretrained_weights_for_pe'):
-                print("\nExpanding pretrained weights for VS3D-PE...")
-                msd = model.expand_pretrained_weights_for_pe(msd)
+            # VS3D-PE uses mid-layer injection; no input-channel expansion
             
             model.load_state_dict(msd)
             total = len(state)
@@ -571,6 +579,16 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
     loss_meter = AverageMeter()
 
     model.train()
+    # Enable PE debug collectors at epoch start if configured
+    try:
+        if getattr(args, 'use_vs3d_pe', False):
+            base_model = model.module if hasattr(model, 'module') else model
+            if hasattr(base_model, 'enable_pe_debug_collect'):
+                base_model.enable_pe_debug_collect(True)
+            if hasattr(base_model, 'reset_pe_debug_stats'):
+                base_model.reset_pe_debug_stats()
+    except Exception:
+        pass
     end = time.time()
     max_iter = args.epochs * len(train_loader)
 
@@ -581,14 +599,11 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
         data_time.update(time.time() - end)
 
         # Handle variable-length batch_data (with or without PE data)
-        if len(batch_data) == 7:  # With PE metadata
-            (coords, feat, label_3d, feat_3d, mask, coords_world, pe_metadata) = batch_data
+        if len(batch_data) == 7:  # With Fourier PE (optimized format)
+            (coords, feat, label_3d, feat_3d, mask, fourier_pe, view_counts) = batch_data
         else:  # Without PE metadata (backward compatible)
             (coords, feat, label_3d, feat_3d, mask) = batch_data
-            coords_world, pe_metadata = None, None
-
-        # Light random translation while keeping integer coordinates
-        # coords[:, 1:4] += (torch.rand(3) * 100).type_as(coords)
+            fourier_pe, view_counts = None, None
 
         # Move to GPU before building SparseTensor and sanitize fused 3D features
         feat_3d = torch.nan_to_num(feat_3d, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -599,17 +614,21 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
         sinput = SparseTensor(feat_gpu, coords_gpu)
         feat_3d, mask = feat_3d.cuda(non_blocking=True), mask.cuda(non_blocking=True)
         
-        # Prepare PE data AFTER mask is ready
-        if coords_world is not None:
+        # Prepare PE data (tuple of Fourier tensors + view_counts)
+        if fourier_pe is not None:
+            # Move packed Fourier tensors to GPU once per batch to avoid per-call transfers
+            fourier_on_gpu = tuple(t.cuda(non_blocking=True) for t in fourier_pe)
+            vc_gpu = view_counts.long().cuda(non_blocking=True)  # ensure int64 for repeat_interleave
             pe_data = (
-                coords_world.cuda(non_blocking=True), 
-                pe_metadata,
+                fourier_on_gpu,  # Tuple of tensors, each [total_views_i, 63] on GPU
+                vc_gpu,  # [N_total] int64
                 mask  # Pass mask so model knows which points have PE data
             )
         else:
             pe_data = None
-
+        
         output_3d = model(sinput, pe_data=pe_data)
+        
         # Sanitize network outputs to prevent propagation of non-finite values
         output_3d = torch.nan_to_num(output_3d, nan=0.0, posinf=1e4, neginf=-1e4)
         output_3d = output_3d[mask]
@@ -623,20 +642,39 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
                     & (feat_3d.abs().sum(dim=1) > 0)
                 )
             if valid_rows.any():
-                # Hybrid loss: pointwise cosine + InfoNCE contrastive
                 output_valid = output_3d[valid_rows]
                 feat_valid = feat_3d[valid_rows]
                 
-                # L_point: original pointwise alignment
                 cosv = nn.functional.cosine_similarity(
                     output_valid, feat_valid, dim=1, eps=1e-6
                 )
                 loss_point = (1 - cosv).mean()
-                
-                # L_contrast: InfoNCE for structural learning
+                # cosine baseline: no contrastive term
+                loss = loss_point
+                loss_contrast = torch.zeros_like(loss_point)
+            else:
+                loss = torch.zeros((), device=output_3d.device, dtype=output_3d.dtype)
+                loss_point = loss.clone()
+                loss_contrast = torch.zeros_like(loss)
+        elif hasattr(args, 'loss_type') and str(args.loss_type).lower() in ('infonce', 'contrast'):
+            # Hybrid loss: cosine pointwise + InfoNCE contrastive
+            with torch.no_grad():
+                valid_rows = (
+                    torch.isfinite(output_3d).all(dim=1)
+                    & torch.isfinite(feat_3d).all(dim=1)
+                    & (feat_3d.abs().sum(dim=1) > 0)
+                )
+            if valid_rows.any():
+                output_valid = output_3d[valid_rows]
+                feat_valid = feat_3d[valid_rows]
+                # L_point
+                cosv = nn.functional.cosine_similarity(
+                    output_valid, feat_valid, dim=1, eps=1e-6
+                )
+                loss_point = (1 - cosv).mean()
+                # L_contrast
                 loss_contrast = info_nce_loss(output_valid, feat_valid, temperature=0.07)
-                
-                # Hybrid: α=0.5 (balance stability and robustness)
+                # Hybrid
                 alpha = 0.5
                 loss = alpha * loss_point + (1 - alpha) * loss_contrast
             else:
@@ -692,10 +730,14 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
         if main_process():
             # writer.add_scalar('loss_train_batch', loss_meter.val, current_iter)
             writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], current_iter)
-            # Log hybrid loss components
-            if hasattr(args, 'loss_type') and args.loss_type == 'cosine':
-                writer.add_scalar('loss/loss_point', loss_point.item(), current_iter)
-                writer.add_scalar('loss/loss_contrast', loss_contrast.item(), current_iter)
+            # Log loss components according to loss_type
+            if hasattr(args, 'loss_type'):
+                lt = str(args.loss_type).lower()
+                if lt == 'cosine':
+                    writer.add_scalar('loss/loss_point', loss_point.item(), current_iter)
+                elif lt in ('infonce', 'contrast'):
+                    writer.add_scalar('loss/loss_point', loss_point.item(), current_iter)
+                    writer.add_scalar('loss/loss_contrast', loss_contrast.item(), current_iter)
 
         end = time.time()
 
@@ -750,11 +792,25 @@ def validate(val_loader, model, criterion):
 
     with torch.no_grad():
         for batch_data in tqdm(val_loader):
-            (coords, feat, label, inds_reverse) = batch_data
+            # Strict, aligned evaluation: if use_vs3d_pe, expect PE-aware batches; else baseline batches
+            if getattr(args, 'use_vs3d_pe', False):
+                # Expect (coords, feat, label, feat_3d, mask, inds_reverse, fourier_pe, view_counts)
+                assert len(batch_data) == 8, f"[VAL] Expected 8-tuple with PE, got {len(batch_data)}"
+                coords, feat, label, _, mask, inds_reverse, fourier_pe, view_counts = batch_data
+                # Move PE to GPU
+                fourier_on_gpu = tuple(t.cuda(non_blocking=True) for t in fourier_pe)
+                vc_gpu = view_counts.long().cuda(non_blocking=True)
+                pe_data = (fourier_on_gpu, vc_gpu, mask.cuda(non_blocking=True))
+            else:
+                # Expect baseline: (coords, feat, label, inds_reverse)
+                assert len(batch_data) == 4, f"[VAL] Expected 4-tuple baseline batch, got {len(batch_data)}"
+                coords, feat, label, inds_reverse = batch_data
+                pe_data = None
+
             sinput = SparseTensor(
                 feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
             label = label.cuda(non_blocking=True)
-            output = model(sinput)
+            output = model(sinput, pe_data=pe_data)
             output = output[inds_reverse, :]
             text = text_features
             # Align with inference: use half precision on both sides, no normalization or scaling

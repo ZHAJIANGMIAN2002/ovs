@@ -280,13 +280,29 @@ def evaluate(model, val_data_loader, labelset_name='scannet_3d'):
             if mark_no_feature_to_unknown:
                 masks = []
 
-            for i, (coords, feat, label, feat_3d, mask, inds_reverse) in enumerate(tqdm(val_data_loader)):
+            for i, batch in enumerate(tqdm(val_data_loader)):
+                # Branch by tuple length to avoid unpack errors
+                if hasattr(args, 'use_vs3d_pe') and args.use_vs3d_pe and len(batch) == 8:
+                    # (coords, feat, label, feat_3d, mask, inds_reverse, fourier_pe, view_counts)
+                    coords, feat, label, feat_3d, mask, inds_reverse, fourier_pe, view_counts = batch
+                    fourier_on_gpu = tuple(t.cuda(non_blocking=True) for t in fourier_pe)
+                    # VS3D-PE expects view_counts for masked (visible) points only
+                    vc_masked = view_counts[mask]
+                    vc_gpu = vc_masked.long().cuda(non_blocking=True)
+                    pe_data = (fourier_on_gpu, vc_gpu, mask.cuda(non_blocking=True))
+                elif len(batch) == 6:
+                    # Baseline/Fusion 6-tuple without packed PE
+                    coords, feat, label, feat_3d, mask, inds_reverse = batch
+                    pe_data = None
+                else:
+                    raise RuntimeError(f"[EVAL] Unexpected batch length {len(batch)} with use_vs3d_pe={getattr(args,'use_vs3d_pe', False)}")
+
                 sinput = SparseTensor(feat.cuda(non_blocking=True), coords.cuda(non_blocking=True))
                 coords = coords[inds_reverse, :]
                 pcl = coords[:, 1:].cpu().numpy()
 
                 if feature_type == 'distill':
-                    predictions = model(sinput)
+                    predictions = model(sinput, pe_data=pe_data)
                     predictions = predictions[inds_reverse, :]
                     pred = predictions.half() @ text_features.t()
                     logits_pred = torch.max(pred, 1)[1].cpu()
@@ -304,7 +320,7 @@ def evaluate(model, val_data_loader, labelset_name='scannet_3d'):
                     # pred_fusion = feat_fuse.half() @ text_features.t()
                     pred_fusion = (feat_fuse/(feat_fuse.norm(dim=-1, keepdim=True)+1e-5)).half() @ text_features.t()
 
-                    predictions = model(sinput)
+                    predictions = model(sinput, pe_data=pe_data)
                     predictions = predictions[inds_reverse, :]
                     # pred_distill = predictions.half() @ text_features.t()
                     pred_distill = (predictions/(predictions.norm(dim=-1, keepdim=True)+1e-5)).half() @ text_features.t()

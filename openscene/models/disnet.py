@@ -5,12 +5,13 @@ from models.mink_unet import mink_unet
 import torch
 from torch import nn
 import importlib.util
+import os
 
 # Import the PTV3 Adapter
 from models.ptv3_adapter import PTV3Adapter
 
 # Import VS3D-PE module
-from models.vs3d_pe import VS3DPEEncoder
+from models.vs3d_pe import VS3DPEEncoder, PECatLinear
 
 # Import SparseTensor for PE voxelization alignment
 from MinkowskiEngine import SparseTensor
@@ -56,15 +57,19 @@ class DisNet(nn.Module):
             # Store original in_channels for potential weight transfer
             original_in_channels = requested_in_channels
             
-            # CRITICAL: If VS3D-PE is enabled, expand input channels BEFORE creating PTV3Adapter
+            # VS3D-PE injection mode: 'mid' (default, DITR-style) or 'input'
             use_pe = getattr(cfg, 'use_vs3d_pe', False)
+            inject_mode = 'mid'
             if use_pe:
-                pe_cfg = getattr(cfg, 'vs3d_pe', {})
-                pe_output_dim = pe_cfg.get('output_dim', 32) if isinstance(pe_cfg, dict) else getattr(pe_cfg, 'output_dim', 32)
-                pe_projected_dim = 64  # PE is projected to 64 dims
-                requested_in_channels = original_in_channels + pe_projected_dim  # 3 + 64 = 67
-                ptv3_cfg['in_channels'] = requested_in_channels
-                print(f"VS3D-PE enabled: Expanding PTv3 input channels to {requested_in_channels} (RGB + PE)")
+                pe_cfg_tmp = getattr(cfg, 'vs3d_pe', {})
+                if isinstance(pe_cfg_tmp, dict):
+                    inject_mode = pe_cfg_tmp.get('inject', 'mid')
+                else:
+                    inject_mode = getattr(pe_cfg_tmp, 'inject', 'mid')
+
+            # Always use mid-layer injection: keep pretrained input channels intact
+            requested_in_channels = original_in_channels
+            ptv3_cfg['in_channels'] = requested_in_channels
             
             self.net3d = PTV3Adapter(
                 ptv3_cfg=ptv3_cfg,
@@ -72,9 +77,9 @@ class DisNet(nn.Module):
                 voxel_size=cfg.voxel_size
             )
             
-            # If PE enabled and pretrained weights loaded, expand first layer weights intelligently
+            # No input-channel expansion when using mid-layer injection
             self.original_in_channels = original_in_channels
-            self.use_pe_for_init = use_pe
+            self.use_pe_for_init = False
             
             # The output of PTV3 may not match `last_dim`. Add a projection head.
             # From the PTV3 config: dec_channels=(64, 64, 128, 256)
@@ -92,11 +97,8 @@ class DisNet(nn.Module):
             
         else:
             # Original MinkowskiNet for 3D point clouds
-            # If VS3D-PE enabled, expand input channels
+            # Keep input channels intact; VS3D-PE uses mid-layer injection only for PTv3
             mink_in_channels = 3
-            if getattr(cfg, 'use_vs3d_pe', False):
-                mink_in_channels = 67  # 3 (RGB) + 64 (PE)
-                print(f"VS3D-PE enabled: Expanding MinkUNet input channels to {mink_in_channels}")
             self.net3d = mink_unet(in_channels=mink_in_channels, out_channels=last_dim, D=3, arch=cfg.arch_3d)
             self.projection_head = None
 
@@ -117,121 +119,107 @@ class DisNet(nn.Module):
                 pe_output_dim = getattr(pe_cfg, 'output_dim', 32)
                 fusion_mode = getattr(pe_cfg, 'fusion', 'mean')
             
-            # Create PE encoder (outputs 64-dim directly, no extra projection needed)
+            # Fixed to mid-layer injection
+            self.pe_inject_mode = 'mid'
+
+            # Create PE encoder (optimized: uses pre-computed Fourier features)
             self.pe_encoder = VS3DPEEncoder(
-                num_frequencies=num_freq,
+                input_dim=63,  # Pre-computed Fourier features (3 + 3*2*10)
                 hidden_dim=hidden_dim,
                 output_dim=64,  # Output 64-dim directly (will concat with RGB's 3 dims)
                 fusion=fusion_mode
             )
+
+            # Mid-layer injectors (DITR-style Cat+Linear)
+            if arch == 'PTV3Adapter':
+                ptv3_out_dim = ptv3_cfg['dec_channels'][0]
+                # Optional: per-stage injectors for DITR "all blocks"
+                inject_all = False
+                inject_stages = None
+                if isinstance(pe_cfg, dict):
+                    inject_all = bool(pe_cfg.get('inject_all_blocks', False))
+                    inject_stages = pe_cfg.get('inject_stages', None)
+                else:
+                    inject_all = bool(getattr(pe_cfg, 'inject_all_blocks', False))
+                    inject_stages = getattr(pe_cfg, 'inject_stages', None)
+                self.inject_all_blocks = inject_all
+                if self.inject_all_blocks:
+                    stage_dims = list(ptv3_cfg['dec_channels'])
+                    from torch import nn as _nn
+                    self.pe_injectors_by_stage = _nn.ModuleDict()
+                    for s, dim in enumerate(stage_dims):
+                        if inject_stages is not None and isinstance(inject_stages, (list, tuple)) and (s not in inject_stages):
+                            continue
+                        self.pe_injectors_by_stage[f'dec{s}'] = PECatLinear(feat_dim=dim, pe_dim=64, use_layernorm=True, alpha_init=0.1)
+                    # Do not keep single last-block injector to avoid DDP unused params
+                    self.pe_injector = None
+                else:
+                    # Single last-block injector only
+                    self.pe_injectors_by_stage = None
+                    self.pe_injector = PECatLinear(feat_dim=ptv3_out_dim, pe_dim=64, use_layernorm=True, alpha_init=0.1)
+            else:
+                self.pe_injector = None
+                self.inject_all_blocks = False
+                self.pe_injectors_by_stage = None
         else:
             self.pe_encoder = None
+            self.pe_inject_mode = 'none'
+            self.pe_injector = None
 
 
-    def expand_pretrained_weights_for_pe(self, pretrained_state_dict):
-        """Intelligently expand pretrained weights to accommodate PE channels.
-        
-        For the first layer that takes [in_channels, ...] input:
-        - Keep the first 3 channels from pretrained (RGB)
-        - Initialize the remaining 64 channels (PE) with small random values
-        
-        This preserves learned RGB features while adding learnable PE features.
-        """
-        if not self.use_pe_for_init:
-            return pretrained_state_dict
-        
-        print(f"\n{'='*70}")
-        print("Expanding pretrained weights for VS3D-PE...")
-        print(f"{'='*70}")
-        
-        new_state_dict = {}
-        for key, value in pretrained_state_dict.items():
-            # Find first layer weights based on actual checkpoint structure:
-            # For PTv3: 'module.net3d.backbone.embedding.stem.conv.weight' → shape (32, 5, 5, 5, 3)
-            # For MinkUNet: 'module.net3d.conv0p1s1.kernel' → shape (125, 3, 32)
-            
-            is_first_layer = False
-            
-            # PTv3: embedding.stem.conv.weight
-            if 'embedding' in key and 'stem' in key and 'conv.weight' in key:
-                is_first_layer = True
-            
-            # MinkUNet: conv0p1s1.kernel
-            if 'conv0' in key and 'kernel' in key:
-                is_first_layer = True
-            
-            if is_first_layer and value.dim() >= 2:
-                # Check if this has in_channels dimension = 3
-                if value.shape[-1] == self.original_in_channels or value.shape[1] == self.original_in_channels or value.shape[0] == self.original_in_channels:
-                    # Determine format based on checkpoint:
-                    # PTv3: (32, 5, 5, 5, 3) → in_channels at dim=-1
-                    # MinkUNet: (125, 3, 32) → in_channels at dim=1
-                    
-                    new_shape = list(value.shape)
-                    
-                    if value.shape[-1] == self.original_in_channels:  # PTv3: (..., 3)
-                        in_channels_dim = -1
-                        new_shape[-1] = self.original_in_channels + 64  # 3 → 67
-                    elif value.shape[1] == self.original_in_channels:  # MinkUNet: (K, 3, C)
-                        in_channels_dim = 1
-                        new_shape[1] = self.original_in_channels + 64
-                    else:  # (3, ...) format
-                        in_channels_dim = 0
-                        new_shape[0] = self.original_in_channels + 64
-                    
-                    # Create expanded weight tensor
-                    new_weight = torch.zeros(new_shape, dtype=value.dtype, device=value.device)
-                    
-                    # Copy pretrained RGB channels and initialize PE channels
-                    if in_channels_dim == -1:  # PTv3: (..., 3) → (..., 67)
-                        new_weight[..., :self.original_in_channels] = value
-                        torch.nn.init.kaiming_normal_(new_weight[..., self.original_in_channels:], mode='fan_out')
-                        new_weight[..., self.original_in_channels:] *= 0.1
-                    elif in_channels_dim == 1:  # MinkUNet: (K, 3, C) → (K, 67, C)
-                        new_weight[:, :self.original_in_channels, :] = value
-                        torch.nn.init.kaiming_normal_(new_weight[:, self.original_in_channels:, :], mode='fan_out')
-                        new_weight[:, self.original_in_channels:, :] *= 0.1
-                    else:  # (3, ...) → (67, ...)
-                        new_weight[:self.original_in_channels, ...] = value
-                        torch.nn.init.kaiming_normal_(new_weight[self.original_in_channels:, ...], mode='fan_out')
-                        new_weight[self.original_in_channels:, ...] *= 0.1
-                    
-                    new_state_dict[key] = new_weight
-                    print(f"✅ Expanded {key}")
-                    print(f"   Shape: {tuple(value.shape)} → {tuple(new_weight.shape)}")
-                    print(f"   RGB channels [0:{self.original_in_channels}]: from pretrained ✅")
-                    print(f"   PE channels [{self.original_in_channels}:67]: random init ×0.1 🆕")
-                else:
-                    new_state_dict[key] = value
-            else:
-                new_state_dict[key] = value
-        
-        print(f"{'='*70}\n")
-        return new_state_dict
+    # Removed input-channel expansion/weight surgery: mid-layer injection only
     
     def forward(self, sparse_3d, pe_data=None):
         '''Forward method with optional VS3D-PE.
         
         Args:
             sparse_3d: SparseTensor with features [N_vox, 3] (after voxelization)
-            pe_data: Optional tuple of (coords_world_masked, pe_metadata_masked, mask)
+            pe_data: Optional tuple of (fourier_pe_batch, view_counts_voxelized, mask_voxelized)
+                     - fourier_pe_batch: packed Fourier features for all visible voxelized points
+                     - view_counts_voxelized: [N_vox] view counts per voxelized point
+                     - mask_voxelized: [N_vox] bool, which voxelized points have PE data
         '''
         if self.use_vs3d_pe and pe_data is not None:
-            coords_world_masked, pe_metadata_masked, mask = pe_data
-            
-            # Compute PE for visible (masked) points
-            pe_feat_masked = self.pe_encoder(coords_world_masked, pe_metadata_masked)  # [N_masked, 64]
-            
-            # Expand PE to full size (zeros for non-visible points)
+            fourier_pe_batch, view_counts_voxelized, mask_voxelized = pe_data
+
+            # Sanity align lengths with current SparseTensor
             N_vox = sparse_3d.F.shape[0]
-            pe_feat_full = torch.zeros(N_vox, 64, device=sparse_3d.F.device, dtype=sparse_3d.F.dtype)
-            pe_feat_full[mask] = pe_feat_masked  # Fill visible points with PE
-            
-            # Concatenate RGB + PE → [N_vox, 67]
-            sparse_3d._F = torch.cat([sparse_3d.F, pe_feat_full], dim=1)
+            if mask_voxelized.dtype != torch.bool:
+                mask_voxelized = mask_voxelized.bool()
+            if view_counts_voxelized.numel() != N_vox:
+                if view_counts_voxelized.numel() == int(mask_voxelized.sum().item()):
+                    vc_full = torch.zeros(N_vox, dtype=view_counts_voxelized.dtype, device=view_counts_voxelized.device)
+                    vc_full[mask_voxelized] = view_counts_voxelized
+                    view_counts_voxelized = vc_full
+                else:
+                    raise RuntimeError(f"[DisNet] view_counts size mismatch: vc={view_counts_voxelized.numel()} vs N_vox={N_vox}, mask_sum={int(mask_voxelized.sum().item())}")
+
+            # Compute PE only for visible points
+            vc_nonzero = view_counts_voxelized[mask_voxelized]
+            pe_feat_masked = self.pe_encoder(fourier_pe_batch, vc_nonzero)
+
+            # Full-size PE tensor for injection
+            pe_feat_full = torch.zeros(N_vox, 64, device=sparse_3d.F.device, dtype=torch.float32)
+            pe_feat_full[mask_voxelized] = pe_feat_masked
+
+            # Pass PE to PTv3 backbone for internal injection
+            if isinstance(self.net3d, PTV3Adapter) and self.pe_inject_mode == 'mid':
+                # Attach one-shot PE features
+                setattr(self.net3d.backbone, '_pe_full', pe_feat_full)
+                if self.inject_all_blocks and self.pe_injectors_by_stage is not None:
+                    # Register per-stage injectors on backbone
+                    setattr(self.net3d.backbone, '_pe_injectors_by_stage', self.pe_injectors_by_stage)
+                    # Ensure no last-block injector is used simultaneously
+                    if hasattr(self.net3d.backbone, '_pe_injector_last'):
+                        setattr(self.net3d.backbone, '_pe_injector_last', None)
+                else:
+                    # Single last-block injector
+                    setattr(self.net3d.backbone, '_pe_injector_last', self.pe_injector)
         
         # Forward through backbone (expects in_channels=3 or 67 depending on use_vs3d_pe)
         x = self.net3d(sparse_3d)
+
+        # Note: mid-layer injection已在PTv3内部完成，如未开启all_blocks且未设置内部注入器，可在此处作为后备，但当前默认不再在此处注入
         if self.projection_head:
             x = self.projection_head(x)
         return x

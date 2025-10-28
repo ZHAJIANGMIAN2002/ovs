@@ -1,7 +1,7 @@
 
 DATA:
   data_root: data/scannet_3d
-  data_root_2d_fused_feature: data/scannet_multiview_lseg_pe  # Use scannet_multiview_lseg_pe for VS3D-PE
+  data_root_2d_fused_feature: data/scannet_multiview_lseg_fourier_pe  # OPTIMIZED: Pre-computed Fourier PE
   feature_2d_extractor: lseg
   classes: 20
   aug: True
@@ -15,15 +15,15 @@ DISTILL:
   in_channels: 3
   pretrained_3d: /root/model_best.pth
   ignore_label: 255
-  train_gpu: [0,1,2,3,4,5,6]  
+  train_gpu: [0,1,2,3,4,5,6,7]
   workers: 8  
-  batch_size: 16  
+  batch_size: 16 
   batch_size_val: 8  
   sync_bn: True
   multiprocessing_distributed: True
   dist_url: tcp://127.0.0.1:6789
   base_lr: 0.0001
-  loss_type: cosine
+  loss_type: infoNCE
   loop: 5
   epochs: 200
   start_epoch: 0
@@ -69,7 +69,10 @@ DISTILL:
     num_frequencies: 10    # Fourier encoding frequency bands (L=10 -> 3+60=63 dims)
     hidden_dim: 128        # MLP hidden dimension (63 -> 128 -> 128 -> 64)
     output_dim: 64         # PE feature dimension (outputs 64-dim directly!)
-    fusion: 'mean'         # View fusion: 'mean' | 'attention'
+    fusion: 'attention'         # View fusion: 'mean' | 'attention'
+    inject: mid            # DITR-style mid-layer injection
+    inject_all_blocks: False  # Set to True for all decoder blocks, False for last block only
+    inject_stages: [0]        # Which decoder stages to inject (0=last, 3=first)
 
 TEST:
   split: val
@@ -84,7 +87,7 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE/model/model_best_rank1.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE_pe/model/model_best_rank1.pth.tar'
   save_folder:
 
 Distributed:
