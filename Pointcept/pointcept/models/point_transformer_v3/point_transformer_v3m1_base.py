@@ -695,6 +695,11 @@ class PointTransformerV3(PointModule):
                         name=f"block{i}",
                     )
                 self.dec.add(module=dec, name=f"dec{s}")
+        
+        # Hook: per-stage injector at decoder stage outputs (DITR all blocks)
+        # Expect external attributes set by caller:
+        #   - self._pe_injectors_by_stage: dict name->injector module
+        #   - self._pe_full: [N, pe_dim] full-length PE features
 
     def forward(self, data_dict):
         point = Point(data_dict)
@@ -704,7 +709,84 @@ class PointTransformerV3(PointModule):
         point = self.embedding(point)
         point = self.enc(point)
         if not self.cls_mode:
-            point = self.dec(point)
+            # run each decoder stage and inject after stage
+            for name, module in self.dec._modules.items():
+                point = module(point)
+                if hasattr(self, "_pe_injectors_by_stage") and getattr(self, "_pe_injectors_by_stage") is not None \
+                   and name in self._pe_injectors_by_stage:
+                    injector = self._pe_injectors_by_stage[name]
+                    if injector is not None and hasattr(self, "_pe_full") and self._pe_full is not None:
+                        feat = point.feat
+                        pe_full = self._pe_full
+                        n = min(feat.shape[0], pe_full.shape[0])
+                        if feat.shape[0] != pe_full.shape[0]:
+                            if n > 0:
+                                feat = feat[:n]
+                                pe_full = pe_full[:n]
+                            else:
+                                continue
+                        fused = injector(feat, pe_full.to(feat.dtype))
+                        if fused.shape[0] != point.feat.shape[0]:
+                            pad_n = point.feat.shape[0] - fused.shape[0]
+                            if pad_n > 0:
+                                pad = torch.zeros(pad_n, fused.shape[1], device=fused.device, dtype=fused.dtype)
+                                fused = torch.cat([fused, pad], dim=0)
+                        point.feat = fused
+            # If no per-stage injector provided but a single last-block injector exists, apply it here
+            if (not hasattr(self, "_pe_injectors_by_stage") or self._pe_injectors_by_stage is None) \
+               and hasattr(self, "_pe_injector_last") and getattr(self, "_pe_injector_last") is not None \
+               and hasattr(self, "_pe_full") and self._pe_full is not None:
+                feat = point.feat
+                pe_full = self._pe_full
+                n = min(feat.shape[0], pe_full.shape[0])
+                if feat.shape[0] != pe_full.shape[0]:
+                    if n > 0:
+                        feat = feat[:n]
+                        pe_full = pe_full[:n]
+                    else:
+                        pass
+                fused = self._pe_injector_last(feat, pe_full.to(feat.dtype))
+                if fused.shape[0] != point.feat.shape[0]:
+                    pad_n = point.feat.shape[0] - fused.shape[0]
+                    if pad_n > 0:
+                        pad = torch.zeros(pad_n, fused.shape[1], device=fused.device, dtype=fused.dtype)
+                        fused = torch.cat([fused, pad], dim=0)
+                point.feat = fused
+            # one-shot clear
+            if hasattr(self, "_pe_full"):
+                self._pe_full = None
+            if hasattr(self, "_pe_injectors_by_stage"):
+                self._pe_injectors_by_stage = None
+            # Optional external injection at decoder last block (DITR-style)
+            # Expect attributes set by caller:
+            #   - self._pe_injector_last: callable(module) taking (feat, pe_full) -> fused_feat
+            #   - self._pe_full: tensor [N, pe_dim] aligned with current point.feat
+            if hasattr(self, "_pe_injector_last") and getattr(self, "_pe_injector_last") is not None \
+               and hasattr(self, "_pe_full") and getattr(self, "_pe_full") is not None:
+                try:
+                    feat = point.feat
+                    pe_full = self._pe_full
+                    # Align length if needed
+                    n = min(feat.shape[0], pe_full.shape[0])
+                    if feat.shape[0] != pe_full.shape[0]:
+                        if n > 0:
+                            feat = feat[:n]
+                            pe_full = pe_full[:n]
+                        else:
+                            # Fallback: skip injection if sizes invalid
+                            raise RuntimeError("Empty features for PE injection")
+                    fused = self._pe_injector_last(feat, pe_full.to(feat.dtype))
+                    # If we truncated, pad back to original size with zeros
+                    if fused.shape[0] != point.feat.shape[0]:
+                        pad_n = point.feat.shape[0] - fused.shape[0]
+                        if pad_n > 0:
+                            pad = torch.zeros(pad_n, fused.shape[1], device=fused.device, dtype=fused.dtype)
+                            fused = torch.cat([fused, pad], dim=0)
+                    point.feat = fused
+                finally:
+                    # Clear one-shot attributes to avoid leaking to next forward
+                    self._pe_full = None
+                    # keep injector module for reuse
         # else:
         #     point.feat = torch_scatter.segment_csr(
         #         src=point.feat,
