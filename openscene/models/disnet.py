@@ -158,13 +158,16 @@ class DisNet(nn.Module):
                     self.pe_injectors_by_stage = None
                     self.pe_injector = PECatLinear(feat_dim=ptv3_out_dim, pe_dim=64, use_layernorm=True, alpha_init=0.1)
             else:
-                self.pe_injector = None
+                # MinkUNet: simple output-layer injection via Cat+Linear
                 self.inject_all_blocks = False
                 self.pe_injectors_by_stage = None
+                # feat_dim equals Mink output channels (last_dim)
+                self.pe_injector_mink = PECatLinear(feat_dim=last_dim, pe_dim=64, use_layernorm=True, alpha_init=0.1)
         else:
             self.pe_encoder = None
             self.pe_inject_mode = 'none'
             self.pe_injector = None
+            self.pe_injector_mink = None
 
 
     # Removed input-channel expansion/weight surgery: mid-layer injection only
@@ -179,6 +182,7 @@ class DisNet(nn.Module):
                      - view_counts_voxelized: [N_vox] view counts per voxelized point
                      - mask_voxelized: [N_vox] bool, which voxelized points have PE data
         '''
+        pe_feat_full = None
         if self.use_vs3d_pe and pe_data is not None:
             fourier_pe_batch, view_counts_voxelized, mask_voxelized = pe_data
 
@@ -218,6 +222,19 @@ class DisNet(nn.Module):
         
         # Forward through backbone (expects in_channels=3 or 67 depending on use_vs3d_pe)
         x = self.net3d(sparse_3d)
+
+        # If using MinkUNet with VS3D-PE, inject at output layer
+        if (self.use_vs3d_pe 
+            and not isinstance(self.net3d, PTV3Adapter)
+            and pe_feat_full is not None 
+            and hasattr(self, 'pe_injector_mink') 
+            and self.pe_injector_mink is not None):
+            # Align lengths if needed (defensive)
+            if pe_feat_full.shape[0] != x.shape[0]:
+                min_len = min(pe_feat_full.shape[0], x.shape[0])
+                x = x[:min_len]
+                pe_feat_full = pe_feat_full[:min_len]
+            x = self.pe_injector_mink(x, pe_feat_full)
 
         # Note: mid-layer injection已在PTv3内部完成，如未开启all_blocks且未设置内部注入器，可在此处作为后备，但当前默认不再在此处注入
         if self.projection_head:

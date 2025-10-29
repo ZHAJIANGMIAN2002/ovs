@@ -60,6 +60,55 @@ def is_url(url):
     scheme = urllib.parse.urlparse(url).scheme
     return scheme in ('http', 'https')
 
+def load_state_dict_flexible(model, state_dict, logger=None):
+    """Robust checkpoint loader:
+    - Strips leading 'module.' prefixes if present
+    - Drops unexpected keys (e.g., one-shot PE injector weights)
+    - Loads with strict=False to allow missing keys (keeps model defaults)
+    """
+    # Normalize keys by removing leading 'module.' if present
+    normalized = {}
+    for k, v in state_dict.items():
+        nk = k[7:] if k.startswith('module.') else k
+        # Remap PE injector keys saved on backbone to current module names
+        if nk.startswith('net3d.backbone._pe_injector_last.'):
+            nk = 'pe_injector.' + nk.split('net3d.backbone._pe_injector_last.', 1)[1]
+        elif nk.startswith('net3d.backbone._pe_injectors_by_stage.'):
+            nk = 'pe_injectors_by_stage.' + nk.split('net3d.backbone._pe_injectors_by_stage.', 1)[1]
+        normalized[nk] = v
+
+    model_state = model.state_dict()
+    model_keys = set(model_state.keys())
+    has_module_prefix = any(k.startswith('module.') for k in model_keys)
+
+    def map_to_model_key(key_without_module: str):
+        if has_module_prefix:
+            prefixed = 'module.' + key_without_module
+            if prefixed in model_keys:
+                return prefixed
+        if key_without_module in model_keys:
+            return key_without_module
+        return None
+
+    filtered = {}
+    unexpected = []
+    for k, v in normalized.items():
+        mk = map_to_model_key(k)
+        if mk is not None:
+            filtered[mk] = v
+        else:
+            unexpected.append(k)
+
+    missing = [k for k in model_keys if k not in filtered]
+
+    # Load permissively
+    model.load_state_dict(filtered, strict=False)
+    if logger:
+        logger.info(f"Checkpoint load: matched={len(filtered)} dropped_unexpected={len(unexpected)} missing={len(missing)}")
+        dropped_pe = [k for k in unexpected if 'pe_injector' in k or '_pe_injectors_by_stage' in k]
+        if dropped_pe:
+            logger.info(f"Dropped PE-related keys: {min(len(dropped_pe), 5)} shown e.g., {dropped_pe[:5]}")
+
 def main_process():
     return not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % args.ngpus_per_node == 0)
@@ -165,30 +214,16 @@ def main_worker(gpu, ngpus_per_node, argss):
         pass # do not need to load weight
     elif is_url(args.model_path): # load from url
         checkpoint = model_zoo.load_url(args.model_path, progress=True)
-        model.load_state_dict(checkpoint['state_dict'], strict=True)
+        sd = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+        load_state_dict_flexible(model, sd, logger if main_process() else None)
     
     elif args.model_path is not None and os.path.isfile(args.model_path):
         # load from directory
         if main_process():
             logger.info("=> loading checkpoint '{}'".format(args.model_path))
         checkpoint = torch.load(args.model_path, map_location=lambda storage, loc: storage.cuda())
-        try:
-            model.load_state_dict(checkpoint['state_dict'], strict=True)
-        except Exception as ex:
-            # The model was trained in a parallel manner, so need to be loaded differently
-            from collections import OrderedDict
-            new_state_dict = OrderedDict()
-            for k, v in checkpoint['state_dict'].items():
-                if k.startswith('module.'):
-                    # remove module
-                    k = k[7:]
-                else:
-                    # add module
-                    k = 'module.' + k
-
-                new_state_dict[k]=v
-            model.load_state_dict(new_state_dict, strict=True)
-            logger.info('Loaded a parallel model')
+        sd = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+        load_state_dict_flexible(model, sd, logger if main_process() else None)
 
         if main_process():
             logger.info("=> loaded checkpoint '{}' (epoch {})".format(args.model_path, checkpoint['epoch']))    
@@ -281,8 +316,8 @@ def evaluate(model, val_data_loader, labelset_name='scannet_3d'):
                 masks = []
 
             for i, batch in enumerate(tqdm(val_data_loader)):
-                # Branch by tuple length to avoid unpack errors
-                if hasattr(args, 'use_vs3d_pe') and args.use_vs3d_pe and len(batch) == 8:
+                # Prefer PE when batch provides it (8-tuple); fallback to baseline (6-tuple)
+                if len(batch) == 8:
                     # (coords, feat, label, feat_3d, mask, inds_reverse, fourier_pe, view_counts)
                     coords, feat, label, feat_3d, mask, inds_reverse, fourier_pe, view_counts = batch
                     fourier_on_gpu = tuple(t.cuda(non_blocking=True) for t in fourier_pe)

@@ -34,7 +34,7 @@ DISTILL:
   print_freq: 10
   save_freq: 1
   save_path: out/scannet_ptv3_test 
-  resume: 
+  resume: /root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE_pe_1/model/model_last.pth.tar
   evaluate: True
   eval_freq: 1
 
@@ -87,7 +87,7 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE_pe/model/model_best_rank1.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE_pe_1/model/model_best_rank1.pth.tar'
   save_folder:
 
 Distributed:

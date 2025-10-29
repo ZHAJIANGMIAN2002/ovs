@@ -81,6 +81,55 @@ def main_process():
         args.multiprocessing_distributed and args.rank % args.ngpus_per_node == 0)
 
 
+def load_state_dict_flexible(model, state_dict, logger=None):
+    """Robust checkpoint loader for training/resume (DDP-aware and PE-aware).
+    - Strips leading 'module.' prefixes if present
+    - Remaps PE-injector keys saved under net3d.backbone to current registered modules
+    - Matches model keys with/without DDP 'module.' prefix
+    - Loads with strict=False (keeps model defaults for missing keys)
+    """
+    # Normalize keys (remove module prefix) and remap PE injector paths
+    normalized = {}
+    for k, v in state_dict.items():
+        nk = k[7:] if k.startswith('module.') else k
+        if nk.startswith('net3d.backbone._pe_injector_last.'):
+            nk = 'pe_injector.' + nk.split('net3d.backbone._pe_injector_last.', 1)[1]
+        elif nk.startswith('net3d.backbone._pe_injectors_by_stage.'):
+            nk = 'pe_injectors_by_stage.' + nk.split('net3d.backbone._pe_injectors_by_stage.', 1)[1]
+        normalized[nk] = v
+
+    model_state = model.state_dict()
+    model_keys = set(model_state.keys())
+    has_module_prefix = any(k.startswith('module.') for k in model_keys)
+
+    def map_to_model_key(key_without_module: str):
+        if has_module_prefix:
+            prefixed = 'module.' + key_without_module
+            if prefixed in model_keys:
+                return prefixed
+        if key_without_module in model_keys:
+            return key_without_module
+        return None
+
+    filtered = {}
+    unexpected = []
+    for k, v in normalized.items():
+        mk = map_to_model_key(k)
+        if mk is not None:
+            filtered[mk] = v
+        else:
+            unexpected.append(k)
+
+    missing = [k for k in model_keys if k not in filtered]
+
+    model.load_state_dict(filtered, strict=False)
+    if logger is not None:
+        logger.info(f"[resume] load matched={len(filtered)} dropped_unexpected={len(unexpected)} missing={len(missing)}")
+        dropped_pe = [k for k in unexpected if 'pe_injector' in k or '_pe_injectors_by_stage' in k]
+        if dropped_pe:
+            logger.info(f"[resume] dropped PE-related keys (showing up to 5): {dropped_pe[:5]}")
+
+
 def main():
     '''Main function.'''
 
@@ -204,7 +253,9 @@ def main_worker(gpu, ngpus_per_node, argss):
             checkpoint = torch.load(
                 args.resume, map_location=lambda storage, loc: storage.cuda())
             args.start_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['state_dict'], strict=True)
+            # Use robust loader to handle DDP prefixes and PE-injector keys
+            sd = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+            load_state_dict_flexible(model, sd, logger if main_process() else None)
             optimizer.load_state_dict(checkpoint['optimizer'])
             best_iou = checkpoint['best_iou']
             # Cache scheduler state if available; we'll restore it after creating the scheduler
