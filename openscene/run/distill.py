@@ -675,6 +675,13 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
                 vc_gpu,  # [N_total] int64
                 mask  # Pass mask so model knows which points have PE data
             )
+            
+            # Debug: print avg views per point (controlled by config)
+            if getattr(args, 'debug', False) and (i + 1) % args.print_freq == 0 and main_process():
+                total_views = sum(t.size(0) for t in fourier_on_gpu)
+                num_points = vc_gpu.size(0)
+                avg_views = total_views / float(num_points) if num_points > 0 else 0.0
+                logger.info(f'[DEBUG] Avg views/point: {avg_views:.2f} (total_views={total_views}, num_points={num_points})')
         else:
             pe_data = None
         

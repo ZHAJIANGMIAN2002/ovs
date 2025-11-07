@@ -22,13 +22,14 @@ class VS3DPEEncoder(nn.Module):
         fusion: Fusion strategy - 'mean' or 'attention' (default: 'mean')
     """
     
-    def __init__(self, input_dim=63, hidden_dim=128, output_dim=64, fusion='mean'):
+    def __init__(self, input_dim=63, hidden_dim=128, output_dim=64, fusion='mean', keep_ratio=1.0):
         super().__init__()
         
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.fusion = fusion
+        self.keep_ratio = keep_ratio  # View-drop: 1.0=no drop, <1.0=randomly drop views during training
         
         # Learnable MLP: Fourier[63] → hidden[128] → output[64] (2-layer, matches PETR/PETRv2)
         self.mlp = nn.Sequential(
@@ -72,13 +73,28 @@ class VS3DPEEncoder(nn.Module):
         # Apply MLP to all views at once
         pe_all_views = self.mlp(fourier_all)  # [total_views, output_dim]
         
-        # ===== VECTORIZED AGGREGATION (NO PYTHON LOOP!) =====
-        # Create point indices for each view: [0,0,0,...,1,1,1,...,2,2,...]
-        #                                       └─n_views[0]─┘└─n_views[1]─┘
-        point_ids = torch.repeat_interleave(
-            torch.arange(N_total, device=device, dtype=torch.long),
-            view_counts_batch
-        )  # [total_views]
+        # ===== VIEW-DROP (training only) =====
+        # Only apply if keep_ratio < 1.0 AND avg views per point >= 10
+        avg_views_per_point = fourier_all.size(0) / float(N_total) if N_total > 0 else 0.0
+        apply_view_drop = self.training and self.keep_ratio < 1.0 and avg_views_per_point >= 10.0
+        
+        if apply_view_drop:
+            # Randomly drop views per point (keep_ratio fraction)
+            point_ids_full = torch.repeat_interleave(
+                torch.arange(N_total, device=device, dtype=torch.long),
+                view_counts_batch
+            )  # [total_views]
+            keep_mask = torch.rand(pe_all_views.size(0), device=device) < self.keep_ratio
+            pe_all_views = pe_all_views[keep_mask]
+            point_ids = point_ids_full[keep_mask]
+            # Update view counts after drop
+            view_counts_batch = torch.bincount(point_ids, minlength=N_total).to(view_counts_batch.dtype)
+        else:
+            # No drop: use all views
+            point_ids = torch.repeat_interleave(
+                torch.arange(N_total, device=device, dtype=torch.long),
+                view_counts_batch
+            )  # [total_views]
         
         total_views = pe_all_views.size(0)
         # Sanity check: ensure grouping and src lengths match

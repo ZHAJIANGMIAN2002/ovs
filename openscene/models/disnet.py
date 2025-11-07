@@ -123,11 +123,13 @@ class DisNet(nn.Module):
             self.pe_inject_mode = 'mid'
 
             # Create PE encoder (optimized: uses pre-computed Fourier features)
+            keep_ratio = pe_cfg.get('keep_ratio', 1.0) if isinstance(pe_cfg, dict) else getattr(pe_cfg, 'keep_ratio', 1.0)
             self.pe_encoder = VS3DPEEncoder(
                 input_dim=63,  # Pre-computed Fourier features (3 + 3*2*10)
                 hidden_dim=hidden_dim,
                 output_dim=64,  # Output 64-dim directly (will concat with RGB's 3 dims)
-                fusion=fusion_mode
+                fusion=fusion_mode,
+                keep_ratio=keep_ratio
             )
 
             # Mid-layer injectors (DITR-style Cat+Linear)

@@ -1,9 +1,9 @@
 
 DATA:
-  data_root: data/scannet_3d
-  data_root_2d_fused_feature: data/scannet_multiview_lseg_fourier_pe  # OPTIMIZED: Pre-computed Fourier PE
+  data_root: data/matterport_3d
+  data_root_2d_fused_feature: data/matterport_multiview_lseg_fourier_pe  # Matterport PE features
   feature_2d_extractor: lseg
-  classes: 20
+  classes: 21  # Matterport has 21 classes
   aug: True
   voxel_size: 0.02
   input_color: True
@@ -11,7 +11,7 @@ DATA:
 
 DISTILL:
   arch_3d: PTV3Adapter
-  ptv3_config: config/scannet/ptv3.py
+  ptv3_config: config/matterport/ptv3.py
   in_channels: 3
   pretrained_3d: /root/model_best.pth
   ignore_label: 255
@@ -30,12 +30,12 @@ DISTILL:
   power: 0.9
   debug: False  # Set to True to enable debug prints (e.g., avg_views_per_point)
   momentum: 0.9
-  weight_decay: 0.01 
-  manual_seed: 1463
+  weight_decay: 0.0001 
+  manual_seed: 3407
   print_freq: 10
   save_freq: 1
-  save_path: out/scannet_ptv3_test 
-  resume: /root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE_pe_1/model/model_last.pth.tar
+  save_path: out/matterport_ptv3_lseg_NCE_pe 
+  resume:
   evaluate: True
   eval_freq: 1
 
@@ -89,7 +89,7 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE_pe_1/model/model_best_rank1.pth.tar'
+  model_path:
   save_folder:
 
 Distributed:
