@@ -1,34 +1,100 @@
+
 DATA:
   data_root: data/matterport_3d_40
-  data_root_2d_fused_feature: data/matterport_multiview_openseg_test
-  feature_2d_extractor: openseg
-  classes: 40
+  data_root_2d_fused_feature: data/matterport_multiview_lseg_fourier_pe  # Matterport PE features
+  feature_2d_extractor: lseg
+  classes: 40  
+  aug: True
   voxel_size: 0.02
-  input_color: False
+  input_color: True
   use_shm: False
+
+DISTILL:
+  arch_3d: PTV3Adapter
+  ptv3_config: config/matterport/ptv3.py
+  in_channels: 3
+  pretrained_3d: /root/sonata.pth
+  ignore_label: 255
+  train_gpu: [0,1,2,3,4,5,6,7]
+  workers: 8  
+  batch_size: 8 
+  batch_size_val: 8  
+  sync_bn: True
+  multiprocessing_distributed: True
+  dist_url: tcp://127.0.0.1:6789
+  base_lr: 0.0001
+  loss_type: infoNCE
+  loop: 5
+  epochs: 200
+  start_epoch: 0
+  power: 0.9
+  debug: False  # Set to True to enable debug prints (e.g., avg_views_per_point)
+  momentum: 0.9
+  weight_decay: 0.0001 
+  manual_seed: 3407
+  print_freq: 10
+  save_freq: 1
+  save_path: out/matterport_ptv3_lseg_NCE_pe 
+  resume: 
+  evaluate: True
+  eval_freq: 1
+
+  # Projection head configuration (optional). If omitted, defaults to Linear(64->768)
+  proj_head:
+    type: mlp           # linear | mlp
+    hidden_dim: 256     # only used when type=mlp
+    dropout: 0.1        # only used when type=mlp
+    use_ln: True        # LayerNorm before MLP when type=mlp
+
+  # Add optimizer and scheduler settings from PTV3's original config
+  optimizer:
+    type: "AdamW"
+    lr: 0.006
+    weight_decay: 0.05
   
+  scheduler:
+    type: "OneCycleLR"
+    max_lr: [0.006, 0.0006]
+    pct_start: 0.05
+    anneal_strategy: "cos"
+    div_factor: 10.0
+    final_div_factor: 1000.0
+
+  param_dicts:
+    - keyword: "block"
+      lr: 0.0006
+  
+  # --- VS3D-PE Configuration (View-Specific 3D Positional Encoding) ---
+  use_vs3d_pe: False  # Set to True to enable VS3D-PE
+  vs3d_pe:
+    num_frequencies: 10    # Fourier encoding frequency bands (L=10 -> 3+60=63 dims)
+    hidden_dim: 128        # MLP hidden dimension (63 -> 128 -> 128 -> 64)
+    output_dim: 64         # PE feature dimension (outputs 64-dim directly!)
+    fusion: 'attention'         # View fusion: 'mean' | 'attention'
+    inject: mid            # DITR-style mid-layer injection
+    inject_all_blocks: False  # Set to True for all decoder blocks, False for last block only
+    inject_stages: [0]        # Which decoder stages to inject (0=last, 3=first)
+    keep_ratio: 1.0        # View-drop: 1.0=no drop (default), <1.0=randomly drop views during training
 
 TEST:
-  split: test  # split in [train, val and test]
+  split: test
   prompt_eng: True
   mark_no_feature_to_unknown: True
-  feature_type: 'ensemble' # 'distill' | 'fusion' | 'ensemble'
+  feature_type: 'distill' # We are evaluating the distilled model
   save_feature_as_numpy: False
-  vis_input: True
-  vis_pred: True
-  vis_gt: True
+  vis_input: False
+  vis_pred: False
+  vis_gt: False
   test_workers: 8
   test_gpu: [0]
   test_batch_size: 1
-  model_path:
-  save_folder:
   test_repeats: 5
-  arch_3d: MinkUNet18A
-  manual_seed: 3407
+  model_path: /root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE_pe_1/model/model_best_rank1.pth.tar
+  save_folder:
 
 Distributed:
-  dist_url: tcp://127.0.0.1:6787
+  dist_url: tcp://127.0.0.1:6788 
   dist_backend: 'nccl'
-  multiprocessing_distributed: True
-  world_size: 1
-  rank: 0
+  multiprocessing_distributed: True 
+  world_size: 1  
+  rank: 0   

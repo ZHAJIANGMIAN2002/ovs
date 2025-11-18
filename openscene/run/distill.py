@@ -32,6 +32,26 @@ best_iou = 0.0
 top_k_checkpoints = []  # List of (epoch, mIoU) tuples for top-k models
 
 
+def set_backbone_requires_grad(model, requires_grad: bool) -> None:
+    """
+    Enable/disable gradients for the PTv3 backbone only.
+    Keeps VS3D-PE modules and projection head trainable.
+    """
+    base_model = model.module if hasattr(model, 'module') else model
+    try:
+        net3d = getattr(base_model, 'net3d', None)
+        if net3d is None:
+            return
+        backbone = getattr(net3d, 'backbone', None)
+        if backbone is None:
+            return
+        for p in backbone.parameters():
+            p.requires_grad = requires_grad
+    except Exception:
+        # Fail silently to avoid training interruption on unexpected model variants
+        pass
+
+
 def worker_init_fn(worker_id):
     '''Worker initialization.'''
     random.seed(time.time() + worker_id)
@@ -209,6 +229,43 @@ def main_worker(gpu, ngpus_per_node, argss):
         if main_process():
             print("=> Successfully converted model to use synchronized BatchNorm")
 
+    # ----------------------- Model parameter statistics ----------------------- #
+    if main_process():
+        def _num_params(m):
+            try:
+                return sum(p.numel() for p in m.parameters())
+            except Exception:
+                return 0
+        def _num_trainable(m):
+            try:
+                return sum(p.numel() for p in m.parameters() if getattr(p, "requires_grad", False))
+            except Exception:
+                return 0
+        total_params = _num_params(model)
+        trainable_params = _num_trainable(model)
+        logger.info(f"[params] total={total_params:,} ({total_params/1e6:.2f}M), "
+                    f"trainable={trainable_params:,} ({trainable_params/1e6:.2f}M)")
+        # Optional breakdown by common submodules (best-effort)
+        try:
+            base_model = model  # not wrapped by DDP yet
+            submods = []
+            if hasattr(base_model, "net3d"):
+                submods.append(("net3d", base_model.net3d))
+                if hasattr(base_model.net3d, "backbone"):
+                    submods.append(("net3d.backbone", base_model.net3d.backbone))
+            for name in ("pe_encoder", "pe_injector", "projection_head"):
+                if hasattr(base_model, name):
+                    submods.append((name, getattr(base_model, name)))
+            # pe_injectors_by_stage may be a list/dict of modules
+            if hasattr(base_model, "pe_injectors_by_stage") and getattr(base_model, "pe_injectors_by_stage") is not None:
+                submods.append(("pe_injectors_by_stage", base_model.pe_injectors_by_stage))
+            for n, msub in submods:
+                tp, tr = _num_params(msub), _num_trainable(msub)
+                logger.info(f"[params:{n}] total={tp:,} ({tp/1e6:.2f}M), trainable={tr:,} ({tr/1e6:.2f}M)")
+        except Exception:
+            pass
+    # ------------------------------------------------------------------------ #
+
     # ####################### Optimizer ####################### #
     if hasattr(args, 'optimizer') and args.optimizer.type == 'AdamW':
         # Build param groups without duplication: default group = all params minus special groups
@@ -242,7 +299,12 @@ def main_worker(gpu, ngpus_per_node, argss):
         args.workers = int(args.workers / ngpus_per_node)
         # Move model to GPU first, then wrap with DDP
         model = model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+        # Enable find_unused_parameters for backbone freeze schedule
+        # (frozen params won't receive gradients, DDP needs to know this is intentional)
+        find_unused = getattr(args, 'backbone_freeze_epochs', 0) > 0
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[gpu], find_unused_parameters=find_unused
+        )
     else:
         model = model.cuda()
 
@@ -362,6 +424,15 @@ def main_worker(gpu, ngpus_per_node, argss):
 
     # ####################### Distill ####################### #
     for epoch in range(args.start_epoch, args.epochs):
+        # Backbone freeze/unfreeze schedule (optional)
+        freeze_epochs = getattr(args, 'backbone_freeze_epochs', 0)
+        if isinstance(freeze_epochs, (int, float)) and freeze_epochs > 0:
+            should_freeze = epoch < int(freeze_epochs)
+            set_backbone_requires_grad(model, not should_freeze)
+            if main_process():
+                state = "FROZEN" if should_freeze else "UNFROZEN"
+                logger.info(f"[backbone] epoch {epoch+1}/{args.epochs}: {state}")
+
         if args.distributed:
             train_sampler.set_epoch(epoch)
             if args.evaluate:
@@ -579,44 +650,58 @@ def obtain_text_features_and_palette():
     return text_features, palette
 
 
-def info_nce_loss(student_feat, teacher_feat, temperature=0.07, eps=1e-6):
+def info_nce_loss(
+    student_feat,
+    teacher_feat,
+    temperature: float = 0.05,
+    eps: float = 1e-6,
+    row_chunk_size: int = 2048,
+    col_chunk_size: int = 8192,
+):
     """
-    InfoNCE contrastive loss for distillation.
-    
-    Args:
-        student_feat: (N, C) 3D student features
-        teacher_feat: (N, C) 2D teacher pseudo-labels
-        temperature: float, temperature for softmax
-        eps: float, numerical stability
-    
-    Returns:
-        loss: scalar tensor
+    InfoNCE with two-dimensional streaming chunks (rows and columns) to avoid OOM.
+    Computes row-wise max and denominator in streamed passes without forming large [chunk, N] tensors.
     """
-    # Ensure same dtype (cast to float32 for numerical stability)
+    # Cast to float32 for stable normalization/exp/log
     student_feat = student_feat.float()
     teacher_feat = teacher_feat.float()
-    # Normalize features to use cosine similarity
     student_norm = nn.functional.normalize(student_feat, dim=1, eps=eps)
     teacher_norm = nn.functional.normalize(teacher_feat, dim=1, eps=eps)
-    
-    # Compute similarity matrix: (N, N)
-    # sim[i,j] = cos(student[i], teacher[j])
-    sim_matrix = torch.matmul(student_norm, teacher_norm.t()) / temperature
-    
-    # Positive samples are on the diagonal: sim[i,i]
-    # Negatives are off-diagonal: sim[i,j] where j≠i
-    
-    # For numerical stability, subtract max before exp
-    sim_matrix_exp = torch.exp(sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach())
-    
-    # Denominator: sum over all j (positive + negatives)
-    denom = sim_matrix_exp.sum(dim=1, keepdim=True)
-    
-    # Numerator: only diagonal (positive pairs)
-    pos_sim = torch.diagonal(sim_matrix_exp)
-    
-    # InfoNCE: -log(exp(pos) / sum(exp(all))), normalized by log(N) to match cosine loss scale
-    loss = -torch.log(pos_sim / (denom.squeeze(1) + eps)).mean() / math.log(max(student_feat.size(0), 2))
+
+    N = student_norm.size(0)
+    if N == 0:
+        return torch.zeros((), device=student_norm.device, dtype=student_norm.dtype)
+
+    # Positive similarities (diagonal) without NxN materialization
+    pos_all = (student_norm * teacher_norm).sum(dim=1) / temperature  # [N]
+
+    losses = []
+    for i0 in range(0, N, row_chunk_size):
+        i1 = min(i0 + row_chunk_size, N)
+        S = student_norm[i0:i1]  # [R, C]
+
+        # Pass 1: row-wise maxima across all columns
+        row_max = torch.full((i1 - i0,), -float("inf"), device=S.device, dtype=S.dtype)
+        for j0 in range(0, N, col_chunk_size):
+            j1 = min(j0 + col_chunk_size, N)
+            Tblk = teacher_norm[j0:j1]  # [C_t, C]
+            sim_blk = (S @ Tblk.t()) / temperature  # [R, C_t]
+            row_max = torch.maximum(row_max, sim_blk.max(dim=1).values)
+
+        # Pass 2: streamed denominator sums
+        denom = torch.zeros_like(row_max)
+        for j0 in range(0, N, col_chunk_size):
+            j1 = min(j0 + col_chunk_size, N)
+            Tblk = teacher_norm[j0:j1]
+            sim_blk = (S @ Tblk.t()) / temperature  # [R, C_t]
+            sim_blk = sim_blk - row_max[:, None]
+            denom = denom + torch.exp(sim_blk).sum(dim=1)
+
+        pos = pos_all[i0:i1]
+        loss_chunk = -(pos - row_max) + torch.log(denom + eps)
+        losses.append(loss_chunk)
+
+    loss = torch.cat(losses, dim=0).mean() / math.log(max(N, 2))
     return loss
 
 
@@ -679,9 +764,13 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
             # Debug: print avg views per point (controlled by config)
             if getattr(args, 'debug', False) and (i + 1) % args.print_freq == 0 and main_process():
                 total_views = sum(t.size(0) for t in fourier_on_gpu)
-                num_points = vc_gpu.size(0)
-                avg_views = total_views / float(num_points) if num_points > 0 else 0.0
-                logger.info(f'[DEBUG] Avg views/point: {avg_views:.2f} (total_views={total_views}, num_points={num_points})')
+                num_points_total = vc_gpu.size(0)
+                # Only count points with views > 0 (valid sampled points)
+                num_points_valid = (vc_gpu > 0).sum().item()
+                avg_views_all = total_views / float(num_points_total) if num_points_total > 0 else 0.0
+                avg_views_valid = total_views / float(num_points_valid) if num_points_valid > 0 else 0.0
+                logger.info(f'[DEBUG] Avg views/point: {avg_views_valid:.2f} (valid_only) | {avg_views_all:.2f} (all) | '
+                           f'total_views={total_views}, valid_points={num_points_valid}/{num_points_total}')
         else:
             pe_data = None
         
@@ -711,9 +800,11 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
                 loss = loss_point
                 loss_contrast = torch.zeros_like(loss_point)
             else:
-                loss = torch.zeros((), device=output_3d.device, dtype=output_3d.dtype)
-                loss_point = loss.clone()
-                loss_contrast = torch.zeros_like(loss)
+                # Ensure DDP sees a graph even when no valid rows on this rank
+                dummy = (output_3d.sum() * 0.0)
+                loss = dummy
+                loss_point = dummy
+                loss_contrast = torch.zeros_like(dummy)
         elif hasattr(args, 'loss_type') and str(args.loss_type).lower() in ('infonce', 'contrast'):
             # Hybrid loss: cosine pointwise + InfoNCE contrastive
             with torch.no_grad():
@@ -736,9 +827,11 @@ def distill(train_loader, model, optimizer, scheduler, epoch):
                 alpha = 0.5
                 loss = alpha * loss_point + (1 - alpha) * loss_contrast
             else:
-                loss = torch.zeros((), device=output_3d.device, dtype=output_3d.dtype)
-                loss_point = loss.clone()
-                loss_contrast = loss.clone()
+                # Ensure DDP sees a graph even when no valid rows on this rank
+                dummy = (output_3d.sum() * 0.0)
+                loss = dummy
+                loss_point = dummy
+                loss_contrast = torch.zeros_like(dummy)
         elif hasattr(args, 'loss_type') and args.loss_type == 'l1':
             loss = torch.nn.L1Loss()(output_3d, feat_3d)
             loss_point = loss.clone()

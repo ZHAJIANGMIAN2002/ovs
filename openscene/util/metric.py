@@ -79,26 +79,28 @@ def evaluate(pred_ids, gt_ids, stdout=False, dataset='scannet_3d'):
         mean_iou += class_ious[label_name][0]
         mean_acc += class_accs[label_name]
 
-    mean_iou /= N_CLASSES
-    mean_acc /= N_CLASSES
+    # Average over effective classes only (those with at least one GT point)
+    if count > 0:
+        mean_iou /= count
+        mean_acc /= count
+    else:
+        mean_iou = 0.0
+        mean_acc = 0.0
     if stdout:
         print('classes          IoU')
         print('----------------------------')
         for i in range(N_CLASSES):
             label_name = CLASS_LABELS[i]
-            try:
+            # Print only for classes that participated in evaluation (have GT)
+            if label_name in class_accs:
                 if 'matterport' in dataset:
                     print('{0:<14s}: {1:>5.3f}'.format(label_name, class_accs[label_name]))
-
                 else:
                     print('{0:<14s}: {1:>5.3f}   ({2:>6d}/{3:<6d})'.format(
                         label_name,
                         class_ious[label_name][0],
                         class_ious[label_name][1],
                         class_ious[label_name][2]))
-            except:
-                print(label_name + ' error!')
-                continue
         print('Mean IoU', mean_iou)
         print('Mean Acc', mean_acc)
     return mean_iou

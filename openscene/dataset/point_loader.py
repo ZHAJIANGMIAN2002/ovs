@@ -93,7 +93,7 @@ class Point3DLoader(torch.utils.data.Dataset):
         self.voxelizer = Voxelizer(
             voxel_size=voxel_size,
             clip_bound=None,
-            use_augmentation=True,
+            use_augmentation=self.aug,
             scale_augmentation_bound=self.SCALE_AUGMENTATION_BOUND,
             rotation_augmentation_bound=self.ROTATION_AUGMENTATION_BOUND,
             translation_augmentation_ratio_bound=self.TRANSLATION_AUGMENTATION_RATIO_BOUND)

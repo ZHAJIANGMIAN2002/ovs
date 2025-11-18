@@ -69,14 +69,14 @@ TEST:
   mark_no_feature_to_unknown: True
   feature_type: 'distill' # We are evaluating the distilled model
   save_feature_as_numpy: False
-  vis_input: False
-  vis_pred: False
-  vis_gt: False
+  vis_input: True
+  vis_pred: True
+  vis_gt: True
   test_workers: 8
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE/model/model_best_rank1.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE_pe_1/model/model_best_rank1.pth.tar'
   save_folder:
 
 Distributed:

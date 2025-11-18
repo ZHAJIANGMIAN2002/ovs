@@ -1,7 +1,7 @@
 
 DATA:
   data_root: data/scannet_3d
-  data_root_2d_fused_feature: data/scannet_multiview_lseg_fourier_pe  # OPTIMIZED: Pre-computed Fourier PE
+  data_root_2d_fused_feature: data/scannet_multiview_lseg  # OPTIMIZED: Pre-computed Fourier PE
   feature_2d_extractor: lseg
   classes: 20
   aug: True
@@ -65,7 +65,7 @@ DISTILL:
       lr: 0.0006
   
   # --- VS3D-PE Configuration (View-Specific 3D Positional Encoding) ---
-  use_vs3d_pe: True  # Set to True to enable VS3D-PE
+  use_vs3d_pe: False  # Set to True to enable VS3D-PE
   vs3d_pe:
     num_frequencies: 10    # Fourier encoding frequency bands (L=10 -> 3+60=63 dims)
     hidden_dim: 128        # MLP hidden dimension (63 -> 128 -> 128 -> 64)
@@ -89,7 +89,7 @@ TEST:
   test_gpu: [0]
   test_batch_size: 1
   test_repeats: 5
-  model_path: '/root/zjm/ovs/openscene/out/scannet_ptv3_lseg_NCE_pe_1/model/model_best_rank1.pth.tar'
+  model_path: '/root/zjm/ovs/openscene/out/matterport_ptv3_lseg_infoNCE_pe/model/model_best_rank1.pth.tar'
   save_folder:
 
 Distributed:

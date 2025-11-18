@@ -1,7 +1,7 @@
 
 DATA:
   data_root: data/matterport_3d
-  data_root_2d_fused_feature: data/matterport_multiview_lseg_fourier_pe  # Matterport PE features
+  data_root_2d_fused_feature: data/matterport_multiview_lseg_fourier_pe_v2  # Matterport PE features
   feature_2d_extractor: lseg
   classes: 21  # Matterport has 21 classes
   aug: True
@@ -13,7 +13,7 @@ DISTILL:
   arch_3d: PTV3Adapter
   ptv3_config: config/matterport/ptv3.py
   in_channels: 3
-  pretrained_3d: /root/model_best.pth
+  pretrained_3d: 
   ignore_label: 255
   train_gpu: [0,1,2,3,4,5,6,7]
   workers: 8  
@@ -35,9 +35,10 @@ DISTILL:
   print_freq: 10
   save_freq: 1
   save_path: out/matterport_ptv3_lseg_NCE_pe 
-  resume:
+  resume: /root/zjm/ovs/openscene/out/matterport_ptv3_lseg_infoNCE_pe1/model/model_last.pth.tar
   evaluate: True
   eval_freq: 1
+
 
   # Projection head configuration (optional). If omitted, defaults to Linear(64->768)
   proj_head:
@@ -86,10 +87,10 @@ TEST:
   vis_pred: False
   vis_gt: False
   test_workers: 8
-  test_gpu: [0]
+  test_gpu: [1]
   test_batch_size: 1
   test_repeats: 5
-  model_path:
+  model_path: /root/zjm/ovs/openscene/out/matterport_ptv3_lseg_infoNCE_pe/model/model_best_rank1.pth.tar
   save_folder:
 
 Distributed:

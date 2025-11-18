@@ -74,8 +74,9 @@ class VS3DPEEncoder(nn.Module):
         pe_all_views = self.mlp(fourier_all)  # [total_views, output_dim]
         
         # ===== VIEW-DROP (training only) =====
-        # Only apply if keep_ratio < 1.0 AND avg views per point >= 10
-        avg_views_per_point = fourier_all.size(0) / float(N_total) if N_total > 0 else 0.0
+        # Only apply if keep_ratio < 1.0 AND avg views per point >= 10 (for valid points only)
+        num_valid_points = (view_counts_batch > 0).sum().item()
+        avg_views_per_point = fourier_all.size(0) / float(num_valid_points) if num_valid_points > 0 else 0.0
         apply_view_drop = self.training and self.keep_ratio < 1.0 and avg_views_per_point >= 10.0
         
         if apply_view_drop:
